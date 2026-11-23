@@ -142,6 +142,16 @@ public:
         Trait::construct(alloc,data_+size_,value);
         size_++;
     }
+
+    T& operator[](std::size_t i) noexcept
+    {
+        return *(data_+i);
+    }
+
+    const T& operator[](std::size_t i) const noexcept
+    {
+        return *(data_+i);
+    }
 };
 
 }

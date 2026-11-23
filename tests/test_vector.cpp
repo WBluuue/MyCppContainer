@@ -86,6 +86,14 @@ static_assert(!std::is_copy_assignable_v<vector<int>>);
 static_assert(std::is_nothrow_move_constructible_v<vector<int>>);
 static_assert(std::is_nothrow_move_assignable_v<vector<int>>);
 
+// 下标访问返回元素引用；const 容器只提供 const 引用。
+// decltype 和 noexcept 中的表达式不会实际执行，不会访问空容器。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>()[0]), int&>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>()[0]),
+                             const int&>);
+static_assert(noexcept(std::declval<vector<int>&>()[0]));
+static_assert(noexcept(std::declval<const vector<int>&>()[0]));
+
 TEST_CASE("Vector default construction","[vector]")
 {
     vector<int>v;
@@ -595,6 +603,171 @@ TEST_CASE("Vector push_back constructs and destroys only live elements",
     }
     CHECK(CopyProbe::live == 0);
     CHECK(CopyProbe::destroyed == 4);
+}
+
+TEST_CASE("Vector empty reserve supports move-only element types",
+          "[vector][reserve]")
+{
+    // 没有元素可搬迁，预留原始存储不应要求 T 可拷贝。
+    // 即使某个循环运行零次，循环体内的模板调用通常仍需要通过编译。
+    vector<std::unique_ptr<int>> v;
+    REQUIRE_NOTHROW(v.reserve(4));
+    REQUIRE_NOTHROW(v.reserve(9));
+
+    CHECK(v.size() == 0);
+    CHECK(v.capacity() == 9);
+    CHECK(v.empty());
+}
+
+TEST_CASE("Vector subscript reads and modifies stored values",
+          "[vector][access]")
+{
+    vector<int> v;
+    v.reserve(4);
+    v.push_back(7);
+    v.push_back(11);
+    v.push_back(13);
+    REQUIRE(v.size() == 3);
+
+    // 合法下标由 size 决定；虽然容量为 4，但这里不能访问 v[3]。
+    CHECK(v[0] == 7);
+    CHECK(v[1] == 11);
+    CHECK(v[2] == 13);
+
+    v[1] = 42;
+    const auto& cv = v;
+    CHECK(cv[0] == 7);
+    CHECK(cv[1] == 42);
+    CHECK(cv[2] == 13);
+    CHECK(cv.size() == 3);
+    CHECK(cv.capacity() == 4);
+}
+
+TEST_CASE("Vector subscript refers to elements without copying",
+          "[vector][access]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(2);
+            v.push_back(value);
+            REQUIRE(v.size() == 1);
+
+            const auto& cv = v;
+            auto& writable = v[0];
+            const auto& readable = cv[0];
+
+            // 两个重载都访问同一个对象，不创建元素副本。
+            CHECK(std::addressof(writable) == std::addressof(readable));
+            writable.value = 11;
+            CHECK(readable.value == 11);
+            CHECK(value.value == 7);
+            CHECK(CopyProbe::copies == 1);
+            CHECK(CopyProbe::live == 2);
+            CHECK(CopyProbe::destroyed == 0);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 1);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 2);
+}
+
+TEST_CASE("Vector references remain valid within reserved capacity",
+          "[vector][access]")
+{
+    vector<int> v;
+    v.reserve(3);
+    v.push_back(7);
+    REQUIRE(v.size() == 1);
+    int* first = std::addressof(v[0]);
+
+    REQUIRE_NOTHROW(v.reserve(0));
+    REQUIRE_NOTHROW(v.reserve(1));
+    REQUIRE_NOTHROW(v.reserve(3));
+    CHECK(std::addressof(v[0]) == first);
+
+    // 参数引用容器自身的元素；容量足够时，追加不应使这个引用失效。
+    v.push_back(v[0]);
+    v.push_back(11);
+    REQUIRE(v.size() == 3);
+    CHECK(v.capacity() == 3);
+    CHECK(std::addressof(v[0]) == first);
+    CHECK(v[0] == 7);
+    CHECK(v[1] == 7);
+    CHECK(v[2] == 11);
+}
+
+TEST_CASE("Vector moves preserve element values and addresses",
+          "[vector][access][move]")
+{
+    vector<int> source;
+    source.reserve(4);
+    source.push_back(7);
+    source.push_back(11);
+    REQUIRE(source.size() == 2);
+    int* first = std::addressof(source[0]);
+
+    vector<int> moved(std::move(source));
+    REQUIRE(moved.size() == 2);
+    CHECK(moved[0] == 7);
+    CHECK(moved[1] == 11);
+    CHECK(std::addressof(moved[0]) == first);
+    CHECK(source.size() == 0);
+    CHECK(source.capacity() == 0);
+
+    vector<int> destination;
+    destination.reserve(2);
+    destination.push_back(99);
+    destination = std::move(moved);
+
+    // 固定使用 std::allocator<T> 时，移动直接接管原分配块。
+    REQUIRE(destination.size() == 2);
+    CHECK(destination.capacity() == 4);
+    CHECK(destination[0] == 7);
+    CHECK(destination[1] == 11);
+    CHECK(std::addressof(destination[0]) == first);
+    CHECK(moved.size() == 0);
+    CHECK(moved.capacity() == 0);
+}
+
+TEST_CASE("Vector failed append preserves existing values and addresses",
+          "[vector][access]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(3);
+            v.push_back(value);
+            REQUIRE(v.size() == 1);
+            const CopyProbe* first = std::addressof(v[0]);
+
+            value.value = 11;
+            CopyProbe::throw_on_copy = true;
+            REQUIRE_THROWS_AS(v.push_back(value), std::runtime_error);
+            CopyProbe::throw_on_copy = false;
+
+            // 除了计数正确，原元素的实际值和地址也必须保持。
+            REQUIRE(v.size() == 1);
+            CHECK(v.capacity() == 3);
+            CHECK(v[0].value == 7);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(CopyProbe::live == 2);
+            CHECK(CopyProbe::copies == 1);
+
+            v.push_back(value);
+            REQUIRE(v.size() == 2);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(std::addressof(v[0]) == first);
+        }
+        CHECK(CopyProbe::live == 1);
+    }
+    CHECK(CopyProbe::live == 0);
 }
 
 TEST_CASE("Vector failed push_back preserves live elements",
