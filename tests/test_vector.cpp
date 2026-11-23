@@ -144,6 +144,11 @@ static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>()[0]),
 static_assert(noexcept(std::declval<vector<int>&>()[0]));
 static_assert(noexcept(std::declval<const vector<int>&>()[0]));
 
+// clear 只结束元素生命周期，返回 void；沿用元素析构不抛异常的前提。
+// 新接口尚未实现时，这两条断言会使测试编译失败，这是本轮预期状态。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().clear()), void>);
+static_assert(noexcept(std::declval<vector<int>&>().clear()));
+
 TEST_CASE("Vector default construction","[vector]")
 {
     vector<int>v;
@@ -1171,4 +1176,165 @@ TEST_CASE("Vector move assignment destroys replaced live elements",
     }
     CHECK(CopyProbe::live == 0);
     CHECK(CopyProbe::destroyed == 4);
+}
+
+TEST_CASE("Vector clear preserves empty storage", "[vector][clear]")
+{
+    Tracked::constructed = 0;
+    Tracked::destroyed = 0;
+    {
+        vector<Tracked> v;
+        SECTION("default empty vector")
+        {
+            CHECK(v.capacity() == 0);
+        }
+        SECTION("empty vector with reserved storage")
+        {
+            v.reserve(4);
+        }
+
+        const auto old_capacity = v.capacity();
+        REQUIRE_NOTHROW(v.clear());
+        REQUIRE_NOTHROW(v.clear());
+
+        // 有容量不等于有元素；清空空容器不能构造或析构任何 T。
+        CHECK(v.empty());
+        CHECK(v.size() == 0);
+        CHECK(v.capacity() == old_capacity);
+        CHECK(Tracked::constructed == 0);
+        CHECK(Tracked::destroyed == 0);
+    }
+    CHECK(Tracked::destroyed == 0);
+}
+
+TEST_CASE("Vector clear destroys only live elements once",
+          "[vector][clear][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(5);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+            value.value = 13;
+            v.push_back(value);
+            REQUIRE(CopyProbe::live == 4);
+
+            // 只有三个槽位存在对象；clear 不得拷贝，也不能析构剩余容量。
+            CopyProbe::throw_on_copy = true;
+            REQUIRE_NOTHROW(v.clear());
+            CopyProbe::throw_on_copy = false;
+            CHECK(v.empty());
+            CHECK(v.size() == 0);
+            CHECK(v.capacity() == 5);
+            CHECK(CopyProbe::copies == 3);
+            CHECK(CopyProbe::live == 1);
+            CHECK(CopyProbe::destroyed == 3);
+            CHECK(value.value == 13);
+
+            // 连续清空以及随后容器析构，都不能再次析构已经结束生命周期的对象。
+            v.clear();
+            CHECK(CopyProbe::live == 1);
+            CHECK(CopyProbe::destroyed == 3);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 3);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 4);
+}
+
+TEST_CASE("Vector clear allows repeated reuse of reserved capacity",
+          "[vector][clear][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(3);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+            v.clear();
+            CHECK(CopyProbe::live == 1);
+            CHECK(CopyProbe::destroyed == 2);
+
+            // 不再调用 reserve：应在保留的存储中构造新对象，而非给旧对象赋值。
+            // CopyProbe 没有默认构造和赋值操作；清空前保存的元素引用不再使用。
+            value.value = 13;
+            REQUIRE_NOTHROW(v.push_back(value));
+            REQUIRE(v.size() == 1);
+            CHECK_FALSE(v.empty());
+            CHECK(v.capacity() == 3);
+            CHECK(v[0].value == 13);
+            CHECK(CopyProbe::copies == 3);
+            CHECK(CopyProbe::live == 2);
+
+            v.clear();
+            CHECK(v.empty());
+            CHECK(v.size() == 0);
+            CHECK(v.capacity() == 3);
+            CHECK(CopyProbe::destroyed == 3);
+            value.value = 17;
+            REQUIRE_NOTHROW(v.push_back(value));
+            REQUIRE(v.size() == 1);
+            CHECK(v[0].value == 17);
+            CHECK(v.capacity() == 3);
+            CHECK(CopyProbe::copies == 4);
+            CHECK(CopyProbe::live == 2);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 4);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 5);
+}
+
+TEST_CASE("Vector clear respects ownership after move", "[vector][clear][move]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> source;
+            source.reserve(4);
+            source.push_back(value);
+            value.value = 11;
+            source.push_back(value);
+            vector<CopyProbe> destination(std::move(source));
+
+            SECTION("clearing source leaves transferred elements alive")
+            {
+                // 源对象已经交出所有权；clear 不能影响目标中的对象。
+                REQUIRE_NOTHROW(source.clear());
+                REQUIRE(destination.size() == 2);
+                CHECK(destination.capacity() == 4);
+                CHECK(destination[0].value == 7);
+                CHECK(destination[1].value == 11);
+                CHECK(CopyProbe::live == 3);
+                CHECK(CopyProbe::destroyed == 0);
+            }
+            SECTION("clearing destination destroys transferred elements")
+            {
+                REQUIRE_NOTHROW(destination.clear());
+                CHECK(destination.empty());
+                CHECK(destination.size() == 0);
+                CHECK(destination.capacity() == 4);
+                CHECK(CopyProbe::live == 1);
+                CHECK(CopyProbe::destroyed == 2);
+            }
+            CHECK(source.empty());
+            CHECK(source.size() == 0);
+            CHECK(source.capacity() == 0);
+            CHECK(CopyProbe::copies == 2);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 2);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 3);
 }

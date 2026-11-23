@@ -164,6 +164,15 @@ public:
     {
         return *(data_+i);
     }
+
+    void clear() noexcept
+    {
+        for(std::size_t i=0;i<size_;++i)
+        {
+            Trait::destroy(alloc,data_+i);
+        }
+        size_=0;
+    }
 };
 
 }
