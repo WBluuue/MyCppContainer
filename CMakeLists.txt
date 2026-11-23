@@ -11,3 +11,10 @@ target_include_directories(mycppcontainer INTERFACE
 target_compile_features(mycppcontainer INTERFACE cxx_std_20)
 
 add_subdirectory(examples)
+
+include(CTest)
+
+if(BUILD_TESTING)
+    find_package(Catch2 3 REQUIRED)
+    add_subdirectory(tests)
+endif()
