@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 
 project(MyCppContainer LANGUAGES CXX)
 
-add_executable(container_lab_demo src/main.cpp)
+add_library(mycppcontainer INTERFACE)
 
-target_compile_features(container_lab_demo PRIVATE cxx_std_20)
+target_include_directories(mycppcontainer INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_features(mycppcontainer INTERFACE cxx_std_20)
+
+add_subdirectory(examples)
