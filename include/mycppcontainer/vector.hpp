@@ -129,26 +129,6 @@ public:
         if(size_==capacity_)
         {
             throw std::length_error("Vector: push_back requires reserved capacity");
-            // auto newCapacity_=(capacity_==0?1:capacity_<<1);
-            // if(newCapacity_>Trait::max_size(alloc))
-            // {
-            //     throw std::length_error("Vector: push_back exceeds max_size");
-            // }
-
-            // auto ptr=Trait::allocate(alloc,newCapacity_);
-
-            // for(std::size_t i=0;i<size_;++i)
-            // {
-            //     Trait::construct(alloc,ptr+i,*(data_+i));
-            //     Trait::destroy(alloc,data_+i);
-            // }
-
-            // if(data_!=nullptr)
-            // {
-            //     Trait::deallocate(alloc,data_,capacity_);
-            // }
-            // data_=ptr;
-            // capacity_=newCapacity_;
         }
 
         Trait::construct(alloc,data_+size_,value);
@@ -183,6 +163,19 @@ public:
             Trait::destroy(alloc,data_+i);
         }
         size_=0;
+    }
+
+    template<typename... Args>
+    T& emplace_back(Args&&... args)
+    {
+        if(size_==capacity_)
+        {
+            throw std::length_error("Vector: emplace_back requires reserved capacity");
+        }
+
+        Trait::construct(alloc,data_+size_,std::forward<Args>(args)...);
+        size_++;
+        return *(data_+size_-1);
     }
 };
 

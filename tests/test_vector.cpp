@@ -154,6 +154,12 @@ static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().push_back(
                                std::declval<int&&>())), void>);
 static_assert(!noexcept(std::declval<vector<int>&>().push_back(std::declval<int&&>())));
 
+// emplace_back 返回刚构造元素的引用；容量检查和构造都可能抛异常。
+// 新接口尚未实现时，这些表达式以及下方用例预期无法编译。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().emplace_back()), int&>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().emplace_back(7)), int&>);
+static_assert(!noexcept(std::declval<vector<int>&>().emplace_back(7)));
+
 TEST_CASE("Vector default construction","[vector]")
 {
     vector<int>v;
@@ -1392,7 +1398,7 @@ TEST_CASE("Vector rvalue push_back transfers unique ownership",
 {
     CopyProbe::reset();
     {
-        // unique_ptr 不能拷贝；尚未实现右值重载时，本用例预期无法编译。
+        // unique_ptr 不能拷贝；右值追加必须支持所有权转移。
         vector<std::unique_ptr<CopyProbe>> v;
         v.reserve(3);
         auto first = std::make_unique<CopyProbe>(7);
@@ -1544,4 +1550,201 @@ TEST_CASE("Vector rvalue push_back can move from its own element",
     REQUIRE(v[1] != nullptr);
     CHECK(v[1].get() == object);
     CHECK(*v[1] == 7);
+}
+
+TEST_CASE("Vector emplace_back supports no arguments and returns a reference",
+          "[vector][emplace_back]")
+{
+    vector<int> v;
+    v.reserve(2);
+
+    // 空参数包也要合法；int 的零参数原地构造应进行值初始化，得到 0。
+    auto& first = v.emplace_back();
+    REQUIRE(v.size() == 1);
+    CHECK_FALSE(v.empty());
+    CHECK(v.capacity() == 2);
+    CHECK(first == 0);
+    CHECK(std::addressof(first) == std::addressof(v[0]));
+    first = 42;
+    CHECK(v[0] == 42);
+
+    auto& second = v.emplace_back(7);
+    REQUIRE(v.size() == 2);
+    CHECK(v.capacity() == 2);
+    CHECK(std::addressof(second) == std::addressof(v[1]));
+    CHECK(second == 7);
+    // 没有扩容，第一次返回的引用仍指向原元素。
+    CHECK(first == 42);
+}
+
+TEST_CASE("Vector emplace_back constructs directly and preserves value categories",
+          "[vector][emplace_back][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        Probe value(7);
+        const Probe const_value(11);
+        {
+            vector<Probe> v;
+            v.reserve(4);
+
+            // 直接把 int 交给 Probe 的构造函数，不先创建临时 Probe 再搬进容器。
+            auto& direct = v.emplace_back(3);
+            CHECK(direct.value == 3);
+            CHECK(Probe::copies == 0);
+            CHECK(Probe::moves == 0);
+            CHECK(Probe::destroyed == 0);
+
+            auto& copied = v.emplace_back(value);
+            CHECK(copied.value == 7);
+            CHECK(value.value == 7);
+            CHECK(Probe::copies == 1);
+            CHECK(Probe::moves == 0);
+
+            auto& const_copied = v.emplace_back(const_value);
+            CHECK(const_copied.value == 11);
+            CHECK(Probe::copies == 2);
+            CHECK(Probe::moves == 0);
+
+            // 对所有参数都使用 std::move 会错误地移动上面的普通左值。
+            auto& moved = v.emplace_back(std::move(value));
+            REQUIRE(v.size() == 4);
+            CHECK(v.capacity() == 4);
+            CHECK(moved.value == 7);
+            CHECK(value.value == -1);
+            CHECK(Probe::copies == 2);
+            CHECK(Probe::moves == 1);
+            CHECK(Probe::live == 6);
+            CHECK(Probe::destroyed == 0);
+            CHECK(std::addressof(direct) == std::addressof(v[0]));
+            CHECK(std::addressof(copied) == std::addressof(v[1]));
+            CHECK(std::addressof(const_copied) == std::addressof(v[2]));
+            CHECK(std::addressof(moved) == std::addressof(v[3]));
+        }
+        CHECK(Probe::live == 2);
+        CHECK(Probe::destroyed == 4);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 6);
+}
+
+TEST_CASE("Vector emplace_back forwards multiple arguments with unique ownership",
+          "[vector][emplace_back][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        using Entry = std::pair<int, std::unique_ptr<CopyProbe>>;
+        vector<Entry> v;
+        v.reserve(2);
+        int key = 11;
+        auto owner = std::make_unique<CopyProbe>(7);
+        const auto* object = owner.get();
+
+        // 一个左值和一个只能移动的右值，同时转发到 pair 的构造函数。
+        auto& entry = v.emplace_back(key, std::move(owner));
+        REQUIRE(v.size() == 1);
+        CHECK(v.capacity() == 2);
+        CHECK(owner == nullptr);
+        CHECK(key == 11);
+        CHECK(entry.first == 11);
+        REQUIRE(entry.second != nullptr);
+        CHECK(entry.second.get() == object);
+        CHECK(entry.second->value == 7);
+        CHECK(std::addressof(entry) == std::addressof(v[0]));
+        entry.first = 42;
+        CHECK(v[0].first == 42);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 1);
+
+        v.clear();
+        CHECK(v.empty());
+        CHECK(v.capacity() == 2);
+        CHECK(CopyProbe::live == 0);
+        CHECK(CopyProbe::destroyed == 1);
+        // entry 和 object 此后不再使用；对应对象的生命周期已经结束。
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 1);
+}
+
+TEST_CASE("Vector emplace_back rejects full capacity before constructing",
+          "[vector][emplace_back][exception]")
+{
+    using Probe = RelocationProbe<false>;
+    Probe::reset();
+    {
+        Probe value(11);
+        {
+            vector<Probe> v;
+            SECTION("default vector without storage")
+            {
+                CHECK(v.capacity() == 0);
+            }
+            SECTION("reserved storage is full")
+            {
+                v.reserve(1);
+                v.emplace_back(7);
+            }
+            const auto old_size = v.size();
+            const auto old_capacity = v.capacity();
+            const auto old_live = Probe::live;
+
+            // 如果先尝试移动，Probe 会抛 runtime_error；应先拒绝容量不足。
+            REQUIRE_THROWS_AS(v.emplace_back(std::move(value)), std::length_error);
+            CHECK(v.size() == old_size);
+            CHECK(v.capacity() == old_capacity);
+            CHECK(value.value == 11);
+            CHECK(Probe::moves == 0);
+            CHECK(Probe::copies == 0);
+            CHECK(Probe::live == old_live);
+            CHECK(Probe::destroyed == 0);
+            if (old_size != 0)
+            {
+                CHECK(v[0].value == 7);
+            }
+        }
+        CHECK(Probe::live == 1);
+    }
+    CHECK(Probe::live == 0);
+}
+
+TEST_CASE("Vector failed emplace_back preserves state and permits retry",
+          "[vector][emplace_back][exception]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(11);
+        {
+            vector<CopyProbe> v;
+            v.reserve(3);
+            v.emplace_back(7);
+            const auto* first = std::addressof(v[0]);
+
+            CopyProbe::throw_on_copy = true;
+            REQUIRE_THROWS_AS(v.emplace_back(value), std::runtime_error);
+            CopyProbe::throw_on_copy = false;
+
+            // 构造失败不能增加 size，不能析构失败槽位，也不能破坏已有元素。
+            REQUIRE(v.size() == 1);
+            CHECK(v.capacity() == 3);
+            CHECK(v[0].value == 7);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(CopyProbe::copies == 0);
+            CHECK(CopyProbe::live == 2);
+            CHECK(CopyProbe::destroyed == 0);
+
+            auto& appended = v.emplace_back(value);
+            REQUIRE(v.size() == 2);
+            CHECK(appended.value == 11);
+            CHECK(std::addressof(appended) == std::addressof(v[1]));
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(CopyProbe::copies == 1);
+            CHECK(CopyProbe::live == 3);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 2);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 3);
 }
