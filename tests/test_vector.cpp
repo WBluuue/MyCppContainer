@@ -145,9 +145,14 @@ static_assert(noexcept(std::declval<vector<int>&>()[0]));
 static_assert(noexcept(std::declval<const vector<int>&>()[0]));
 
 // clear 只结束元素生命周期，返回 void；沿用元素析构不抛异常的前提。
-// 新接口尚未实现时，这两条断言会使测试编译失败，这是本轮预期状态。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().clear()), void>);
 static_assert(noexcept(std::declval<vector<int>&>().clear()));
+
+// 右值追加返回 void；容量检查与元素构造都可能抛异常，接口不能承诺 noexcept。
+// 表达式检查本身不能区分两个重载；下方移动计数和 unique_ptr 用例验证实际行为。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().push_back(
+                               std::declval<int&&>())), void>);
+static_assert(!noexcept(std::declval<vector<int>&>().push_back(std::declval<int&&>())));
 
 TEST_CASE("Vector default construction","[vector]")
 {
@@ -1337,4 +1342,206 @@ TEST_CASE("Vector clear respects ownership after move", "[vector][clear][move]")
     }
     CHECK(CopyProbe::live == 0);
     CHECK(CopyProbe::destroyed == 3);
+}
+
+TEST_CASE("Vector rvalue push_back selects move construction",
+          "[vector][push_back][rvalue][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        Probe value(7);
+        {
+            vector<Probe> v;
+            v.reserve(3);
+
+            // 新增右值重载不能改变原来左值追加的拷贝语义。
+            v.push_back(value);
+            CHECK(Probe::copies == 1);
+            CHECK(Probe::moves == 0);
+            CHECK(value.value == 7);
+
+            value.value = 11;
+            v.push_back(std::move(value));
+            REQUIRE(v.size() == 2);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(value.value == -1); // 这是 Probe 的约定，不是所有 T 的通用状态。
+            CHECK(Probe::copies == 1);
+            CHECK(Probe::moves == 1);
+
+            // 临时对象也应走移动构造；该语句结束时临时对象已经析构。
+            v.push_back(Probe(13));
+            REQUIRE(v.size() == 3);
+            CHECK(v.capacity() == 3);
+            CHECK(v[2].value == 13);
+            CHECK(Probe::copies == 1);
+            CHECK(Probe::moves == 2);
+            CHECK(Probe::live == 4);
+            CHECK(Probe::destroyed == 1);
+        }
+        CHECK(Probe::live == 1);
+        CHECK(Probe::destroyed == 4);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
+}
+
+TEST_CASE("Vector rvalue push_back transfers unique ownership",
+          "[vector][push_back][rvalue][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        // unique_ptr 不能拷贝；尚未实现右值重载时，本用例预期无法编译。
+        vector<std::unique_ptr<CopyProbe>> v;
+        v.reserve(3);
+        auto first = std::make_unique<CopyProbe>(7);
+        auto second = std::make_unique<CopyProbe>(11);
+        const auto* first_object = first.get();
+        const auto* second_object = second.get();
+
+        v.push_back(std::move(first));
+        v.push_back(std::move(second));
+        REQUIRE(v.size() == 2);
+        CHECK(v.capacity() == 3);
+        CHECK(first == nullptr);
+        CHECK(second == nullptr);
+        REQUIRE(v[0] != nullptr);
+        REQUIRE(v[1] != nullptr);
+        CHECK(v[0].get() == first_object);
+        CHECK(v[1].get() == second_object);
+        CHECK(v[0]->value == 7);
+        CHECK(v[1]->value == 11);
+
+        // 复用已完成的 reserve：搬迁 unique_ptr 不应复制或销毁其拥有的对象。
+        v.reserve(6);
+        REQUIRE(v.size() == 2);
+        CHECK(v.capacity() == 6);
+        CHECK(v[0].get() == first_object);
+        CHECK(v[1].get() == second_object);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 2);
+        CHECK(CopyProbe::destroyed == 0);
+
+        v.clear();
+        CHECK(v.empty());
+        CHECK(v.capacity() == 6);
+        CHECK(CopyProbe::live == 0);
+        CHECK(CopyProbe::destroyed == 2);
+
+        // 清空后重新接收临时所有者；不再使用此前保存的被管理对象指针。
+        v.push_back(std::make_unique<CopyProbe>(13));
+        REQUIRE(v.size() == 1);
+        REQUIRE(v[0] != nullptr);
+        CHECK(v[0]->value == 13);
+        CHECK(CopyProbe::live == 1);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 3);
+}
+
+TEST_CASE("Vector rvalue push_back rejects full capacity before moving",
+          "[vector][push_back][rvalue][exception]")
+{
+    using Probe = RelocationProbe<false>;
+    Probe::reset();
+    {
+        Probe value(7);
+        {
+            vector<Probe> v;
+            SECTION("default vector without storage")
+            {
+                CHECK(v.capacity() == 0);
+            }
+            SECTION("reserved storage is full")
+            {
+                v.reserve(1);
+                v.push_back(value);
+            }
+            value.value = 11;
+            const auto old_size = v.size();
+            const auto old_capacity = v.capacity();
+            const auto old_copies = Probe::copies;
+            const auto old_live = Probe::live;
+
+            // Probe 的移动会抛 runtime_error；必须先检查容量，抛 length_error。
+            REQUIRE_THROWS_AS(v.push_back(std::move(value)), std::length_error);
+            CHECK(v.size() == old_size);
+            CHECK(v.capacity() == old_capacity);
+            CHECK(value.value == 11);
+            CHECK(Probe::moves == 0);
+            CHECK(Probe::copies == old_copies);
+            CHECK(Probe::live == old_live);
+            CHECK(Probe::destroyed == 0);
+            if (old_size != 0)
+            {
+                CHECK(v[0].value == 7);
+            }
+        }
+        CHECK(Probe::live == 1);
+    }
+    CHECK(Probe::live == 0);
+}
+
+TEST_CASE("Vector failed rvalue push_back preserves its existing elements",
+          "[vector][push_back][rvalue][exception]")
+{
+    using Probe = RelocationProbe<false>;
+    Probe::reset();
+    {
+        Probe value(7);
+        {
+            vector<Probe> v;
+            v.reserve(3);
+            v.push_back(value);
+            const auto* first = std::addressof(v[0]);
+            value.value = 11;
+
+            // 容量足够时按调用者的移动意图构造；不能因移动可能抛异常就改成拷贝。
+            REQUIRE_THROWS_AS(v.push_back(std::move(value)), std::runtime_error);
+            REQUIRE(v.size() == 1);
+            CHECK(v.capacity() == 3);
+            CHECK(v[0].value == 7);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(Probe::moves == 1);
+            CHECK(Probe::copies == 1);
+            CHECK(Probe::live == 2);
+            CHECK(Probe::destroyed == 0);
+
+            // 不对移动失败后的参数值作通用保证；这里显式重设测试对象再用左值追加。
+            // 失败槽位没有存活对象，不应被析构；之后仍可以在该槽位构造。
+            value.value = 13;
+            v.push_back(value);
+            REQUIRE(v.size() == 2);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 13);
+            CHECK(Probe::copies == 2);
+            CHECK(Probe::live == 3);
+        }
+        CHECK(Probe::live == 1);
+        CHECK(Probe::destroyed == 2);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 3);
+}
+
+TEST_CASE("Vector rvalue push_back can move from its own element",
+          "[vector][push_back][rvalue]")
+{
+    vector<std::unique_ptr<int>> v;
+    v.reserve(2);
+    auto owner = std::make_unique<int>(7);
+    const auto* object = owner.get();
+    v.push_back(std::move(owner));
+    auto* first_slot = std::addressof(v[0]);
+
+    // 容量足够时没有搬迁；从第一个元素转移所有权至新元素，不复制被管理的 int。
+    v.push_back(std::move(v[0]));
+    REQUIRE(v.size() == 2);
+    CHECK(v.capacity() == 2);
+    CHECK(std::addressof(v[0]) == first_slot);
+    CHECK(v[0] == nullptr);
+    REQUIRE(v[1] != nullptr);
+    CHECK(v[1].get() == object);
+    CHECK(*v[1] == 7);
 }

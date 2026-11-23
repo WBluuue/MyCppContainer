@@ -155,6 +155,17 @@ public:
         size_++;
     }
 
+    void push_back(T&& value)
+    {
+        if(size_==capacity_)
+        {
+            throw std::length_error("Vector: push_back requires reserved capacity");
+        }
+
+        Trait::construct(alloc,data_+size_,std::move(value));
+        size_++;
+    }
+
     T& operator[](std::size_t i) noexcept
     {
         return *(data_+i);
