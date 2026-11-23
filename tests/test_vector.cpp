@@ -38,6 +38,8 @@ struct CopyProbe {
     inline static int destroyed = 0;
     inline static int last_copied_value = 0;
     inline static bool throw_on_copy = false;
+    // -1 表示不限次数；0 表示下一次拷贝抛异常，用于验证部分搬迁的回滚。
+    inline static int copies_before_throw = -1;
 
     int value;
 
@@ -46,9 +48,13 @@ struct CopyProbe {
 
     CopyProbe(const CopyProbe& other) : value(other.value)
     {
-        if (throw_on_copy)
+        if (throw_on_copy || copies_before_throw == 0)
         {
             throw std::runtime_error("CopyProbe copy failed");
+        }
+        if (copies_before_throw > 0)
+        {
+            --copies_before_throw;
         }
         ++live;
         ++copies;
@@ -71,6 +77,50 @@ struct CopyProbe {
         destroyed = 0;
         last_copied_value = 0;
         throw_on_copy = false;
+        copies_before_throw = -1;
+    }
+};
+
+// 两个实例化分别模拟“不抛异常的移动”和“会抛异常但可以拷贝的移动”。
+// reserve 应选择安全的构造方式；赋值操作不可用，避免把赋值误当作构造。
+template<bool NoThrowMove>
+struct RelocationProbe {
+    inline static int live = 0;
+    inline static int copies = 0;
+    inline static int moves = 0;
+    inline static int destroyed = 0;
+
+    int value;
+
+    explicit RelocationProbe(int v) : value(v) { ++live; }
+    RelocationProbe(const RelocationProbe& other) : value(other.value)
+    {
+        ++live;
+        ++copies;
+    }
+    RelocationProbe(RelocationProbe&& other) noexcept(NoThrowMove)
+        : value(other.value)
+    {
+        ++moves;
+        if constexpr (!NoThrowMove)
+        {
+            throw std::runtime_error("RelocationProbe unsafe move");
+        }
+        ++live;
+        other.value = -1;
+    }
+    RelocationProbe& operator=(const RelocationProbe&) = delete;
+    ~RelocationProbe()
+    {
+        --live;
+        ++destroyed;
+    }
+    static void reset() noexcept
+    {
+        live = 0;
+        copies = 0;
+        moves = 0;
+        destroyed = 0;
     }
 };
 
@@ -809,8 +859,8 @@ TEST_CASE("Vector failed push_back preserves live elements",
     CHECK(CopyProbe::destroyed == 3);
 }
 
-TEST_CASE("Vector reserve rejects growth while elements are alive",
-          "[vector][push_back][lifetime]")
+TEST_CASE("Vector reserve preserves values and destroys replaced elements",
+          "[vector][reserve][lifetime]")
 {
     CopyProbe::reset();
     {
@@ -819,28 +869,222 @@ TEST_CASE("Vector reserve rejects growth while elements are alive",
             vector<CopyProbe> v;
             v.reserve(3);
             v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
 
-            // 有元素时，不超过现有容量的 reserve 仍然是合法的无操作。
+            // 本轮开始支持非空扩容：保留元素顺序和大小，并销毁旧块中的元素。
+            REQUIRE_NOTHROW(v.reserve(6));
+            REQUIRE(v.size() == 2);
+            CHECK(v.capacity() == 6);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(CopyProbe::live == 3);
+            CHECK(CopyProbe::copies == 4);
+            CHECK(CopyProbe::destroyed == 2);
+
+            value.value = 13;
+            REQUIRE_NOTHROW(v.push_back(value));
+            REQUIRE(v.size() == 3);
+            CHECK(v.capacity() == 6);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(v[2].value == 13);
+            CHECK(CopyProbe::live == 4);
+        }
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 5);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 6);
+}
+
+TEST_CASE("Vector reserve within capacity does not relocate live elements",
+          "[vector][reserve]")
+{
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(4);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+            REQUIRE(v.size() == 2);
+            const CopyProbe* first = std::addressof(v[0]);
+
+            // 即使元素一拷贝就抛异常，无需扩容的 reserve 仍须成功且保留引用。
+            CopyProbe::throw_on_copy = true;
             REQUIRE_NOTHROW(v.reserve(0));
             REQUIRE_NOTHROW(v.reserve(1));
-            REQUIRE_NOTHROW(v.reserve(3));
+            REQUIRE_NOTHROW(v.reserve(2));
+            REQUIRE_NOTHROW(v.reserve(4));
+            CopyProbe::throw_on_copy = false;
 
-            // 本轮尚未实现元素搬迁，非空扩容必须被拒绝，不能丢弃旧对象。
-            REQUIRE_THROWS_AS(v.reserve(4), std::logic_error);
-            CHECK(v.size() == 1);
-            CHECK(v.capacity() == 3);
-            CHECK(CopyProbe::live == 2);
-            CHECK(CopyProbe::copies == 1);
+            REQUIRE(v.size() == 2);
+            CHECK(v.capacity() == 4);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(CopyProbe::copies == 2);
             CHECK(CopyProbe::destroyed == 0);
-
-            REQUIRE_NOTHROW(v.push_back(value));
-            CHECK(v.size() == 2);
-            CHECK(v.capacity() == 3);
             CHECK(CopyProbe::live == 3);
         }
         CHECK(CopyProbe::live == 1);
     }
     CHECK(CopyProbe::live == 0);
+}
+
+TEST_CASE("Vector reserve rolls back partial copy construction",
+          "[vector][reserve][exception]")
+{
+    int successful_before_throw = 0;
+    SECTION("first element copy throws") { successful_before_throw = 0; }
+    SECTION("second element copy throws") { successful_before_throw = 1; }
+    SECTION("third element copy throws") { successful_before_throw = 2; }
+
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(4);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+            value.value = 13;
+            v.push_back(value);
+            REQUIRE(v.size() == 3);
+            const CopyProbe* first = std::addressof(v[0]);
+
+            CopyProbe::copies_before_throw = successful_before_throw;
+            REQUIRE_THROWS_AS(v.reserve(8), std::runtime_error);
+            CopyProbe::copies_before_throw = -1;
+
+            // 失败后旧块仍然有效；只销毁新块中已经成功构造的前缀。
+            REQUIRE(v.size() == 3);
+            CHECK(v.capacity() == 4);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(v[2].value == 13);
+            CHECK(CopyProbe::live == 4);
+            CHECK(CopyProbe::copies == 3 + successful_before_throw);
+            CHECK(CopyProbe::destroyed == successful_before_throw);
+
+            // 失败后仍可重新扩容；成功后不再使用已经失效的旧元素指针。
+            REQUIRE_NOTHROW(v.reserve(8));
+            REQUIRE(v.size() == 3);
+            CHECK(v.capacity() == 8);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(v[2].value == 13);
+            CHECK(CopyProbe::live == 4);
+            CHECK(CopyProbe::copies == 6 + successful_before_throw);
+            CHECK(CopyProbe::destroyed == 3 + successful_before_throw);
+        }
+        CHECK(CopyProbe::live == 1);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 7 + successful_before_throw);
+}
+
+TEST_CASE("Vector oversized reserve preserves nonempty state",
+          "[vector][reserve][exception]")
+{
+    using Alloc = std::allocator<CopyProbe>;
+    Alloc alloc;
+    const auto limit = std::allocator_traits<Alloc>::max_size(alloc);
+    REQUIRE(limit < std::numeric_limits<std::size_t>::max());
+
+    CopyProbe::reset();
+    {
+        CopyProbe value(7);
+        {
+            vector<CopyProbe> v;
+            v.reserve(3);
+            v.push_back(value);
+            REQUIRE(v.size() == 1);
+            const CopyProbe* first = std::addressof(v[0]);
+
+            // 超限检查要早于任何元素构造，原来的大小、容量、值和地址均不变。
+            CopyProbe::throw_on_copy = true;
+            REQUIRE_THROWS_AS(v.reserve(limit + 1), std::length_error);
+            CopyProbe::throw_on_copy = false;
+
+            REQUIRE(v.size() == 1);
+            CHECK(v.capacity() == 3);
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(v[0].value == 7);
+            CHECK(CopyProbe::copies == 1);
+            CHECK(CopyProbe::live == 2);
+            CHECK(CopyProbe::destroyed == 0);
+        }
+        CHECK(CopyProbe::live == 1);
+    }
+    CHECK(CopyProbe::live == 0);
+}
+
+TEST_CASE("Vector reserve uses nonthrowing moves when available",
+          "[vector][reserve][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        Probe value(7);
+        {
+            vector<Probe> v;
+            v.reserve(2);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+
+            // push_back(const T&) 负责拷贝；reserve 可用不抛异常的移动搬迁。
+            REQUIRE_NOTHROW(v.reserve(5));
+            REQUIRE(v.size() == 2);
+            CHECK(v.capacity() == 5);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(Probe::copies == 2);
+            CHECK(Probe::moves == 2);
+            CHECK(Probe::destroyed == 2);
+            CHECK(Probe::live == 3);
+        }
+        CHECK(Probe::live == 1);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
+}
+
+TEST_CASE("Vector reserve copies when moving could throw",
+          "[vector][reserve][lifetime]")
+{
+    using Probe = RelocationProbe<false>;
+    Probe::reset();
+    {
+        Probe value(7);
+        {
+            vector<Probe> v;
+            v.reserve(2);
+            v.push_back(value);
+            value.value = 11;
+            v.push_back(value);
+
+            // 这个类型的移动构造会抛异常，但可以拷贝，应通过拷贝完成扩容。
+            REQUIRE_NOTHROW(v.reserve(5));
+            REQUIRE(v.size() == 2);
+            CHECK(v.capacity() == 5);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+            CHECK(Probe::copies == 4);
+            CHECK(Probe::moves == 0);
+            CHECK(Probe::destroyed == 2);
+            CHECK(Probe::live == 3);
+        }
+        CHECK(Probe::live == 1);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
 }
 
 TEST_CASE("Vector move construction transfers live elements without copying",

@@ -3,11 +3,12 @@
 #include<cstddef>
 #include<memory>
 #include<stdexcept>
+#include<utility>
 
 namespace mycppcontainer
 {
     
-template<class T>
+template<typename T>
 class Vector
 {
 private:
@@ -90,18 +91,29 @@ public:
         //not enough -> allocate
         if(n>capacity_)
         {
-            if(size_!=0)
-            {
-                throw std::logic_error("Vector: nonempty reserve growth is not supported yet");
-            }
-
             T* ptr=Trait::allocate(alloc,n);
 
-            // for(std::size_t i=0;i<size_;++i)
-            // {
-            //     Trait::construct(alloc,ptr+i,*(data_+i));
-            //     Trait::destroy(alloc,data_+i);
-            // }
+            for(std::size_t i=0;i<size_;++i)
+            {
+                try
+                {
+                    Trait::construct(alloc,ptr+i,std::move_if_noexcept(*(data_+i)));   
+                }
+                catch(...)
+                {
+                    for(std::size_t j=0;j<i;j++)
+                    {
+                        Trait::destroy(alloc,ptr+j);
+                    }
+                    Trait::deallocate(alloc,ptr,n);
+                    throw;   
+                }
+            }
+             
+            for(std::size_t i=0;i<size_;++i)
+            {
+                Trait::destroy(alloc,data_+i);
+            }
             if(data_!=nullptr)
             {
                 Trait::deallocate(alloc,data_,capacity_);
