@@ -1,4 +1,7 @@
-add_executable(container_lab_tests test_smoke.cpp)
+add_executable(container_lab_tests 
+    test_smoke.cpp
+    test_vector.cpp
+)
 
 target_link_libraries(container_lab_tests
     PRIVATE 

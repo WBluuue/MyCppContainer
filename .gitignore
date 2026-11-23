@@ -1,2 +1,10 @@
 build/
 build-*/
+
+*.o
+*.a
+*.so
+
+.vscode/
+
+*.log
