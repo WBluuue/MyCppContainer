@@ -39,6 +39,10 @@ public:
     {
         if(this!=(&rhs))
         {
+            for(std::size_t i=0;i<size_;++i)
+            {
+                Trait::destroy(alloc,data_+i);
+            }
             if(data_!=nullptr)
             {
                 Trait::deallocate(alloc,data_,capacity_);
@@ -57,6 +61,10 @@ public:
 
     ~Vector()
     {
+        for(std::size_t i=0;i<size_;++i)
+        {
+            Trait::destroy(alloc,data_+i);
+        }
         if(data_!=nullptr)
         {
             Trait::deallocate(alloc,data_,capacity_);
@@ -70,6 +78,7 @@ public:
 
     bool empty() const noexcept { return size_==0; }
 
+public:
     void reserve(std::size_t n)
     {
         //more than limit
@@ -81,16 +90,57 @@ public:
         //not enough -> allocate
         if(n>capacity_)
         {
+            if(size_!=0)
+            {
+                throw std::logic_error("Vector: nonempty reserve growth is not supported yet");
+            }
+
             T* ptr=Trait::allocate(alloc,n);
 
+            // for(std::size_t i=0;i<size_;++i)
+            // {
+            //     Trait::construct(alloc,ptr+i,*(data_+i));
+            //     Trait::destroy(alloc,data_+i);
+            // }
             if(data_!=nullptr)
             {
                 Trait::deallocate(alloc,data_,capacity_);
             }
-            data_=ptr;
 
+            data_=ptr;
             capacity_=n;
         }
+    }
+
+    void push_back(const T& value)
+    {
+        if(size_==capacity_)
+        {
+            throw std::length_error("Vector: push_back requires reserved capacity");
+            // auto newCapacity_=(capacity_==0?1:capacity_<<1);
+            // if(newCapacity_>Trait::max_size(alloc))
+            // {
+            //     throw std::length_error("Vector: push_back exceeds max_size");
+            // }
+
+            // auto ptr=Trait::allocate(alloc,newCapacity_);
+
+            // for(std::size_t i=0;i<size_;++i)
+            // {
+            //     Trait::construct(alloc,ptr+i,*(data_+i));
+            //     Trait::destroy(alloc,data_+i);
+            // }
+
+            // if(data_!=nullptr)
+            // {
+            //     Trait::deallocate(alloc,data_,capacity_);
+            // }
+            // data_=ptr;
+            // capacity_=newCapacity_;
+        }
+
+        Trait::construct(alloc,data_+size_,value);
+        size_++;
     }
 };
 
