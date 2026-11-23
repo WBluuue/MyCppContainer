@@ -25,7 +25,13 @@ public:
 
     Vector(const Vector& v)=delete;
 
-    Vector(Vector&& v)=delete;
+    Vector(Vector&& other) noexcept
+        :data_(other.data_),size_(other.size_),capacity_(other.capacity_)
+    {
+        other.data_=nullptr;
+        other.size_=0;
+        other.capacity_=0;
+    }
 
     Vector& operator=(const Vector& rhs)=delete;
 
