@@ -35,7 +35,25 @@ public:
 
     Vector& operator=(const Vector& rhs)=delete;
 
-    Vector& operator=(Vector&& rhs)=delete;
+    Vector& operator=(Vector&& rhs) noexcept
+    {
+        if(this!=(&rhs))
+        {
+            if(data_!=nullptr)
+            {
+                Trait::deallocate(alloc,data_,capacity_);
+            }
+
+            data_=rhs.data_;
+            size_=rhs.size_;
+            capacity_=rhs.capacity_;
+
+            rhs.data_=nullptr;
+            rhs.size_=0;
+            rhs.capacity_=0;
+        }
+        return *this;
+    }
 
     ~Vector()
     {

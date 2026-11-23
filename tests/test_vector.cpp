@@ -34,11 +34,11 @@ struct Tracked {
 
 static_assert(!std::is_default_constructible_v<NoDefault>);
 
-// 本轮只开放无异常移动构造，复制和两种赋值操作仍然禁止。
+// 本轮开放无异常移动构造和移动赋值；复制操作仍然禁止。
 static_assert(!std::is_copy_constructible_v<vector<int>>);
 static_assert(!std::is_copy_assignable_v<vector<int>>);
 static_assert(std::is_nothrow_move_constructible_v<vector<int>>);
-static_assert(!std::is_move_assignable_v<vector<int>>);
+static_assert(std::is_nothrow_move_assignable_v<vector<int>>);
 
 TEST_CASE("Vector default construction","[vector]")
 {
@@ -276,6 +276,183 @@ TEST_CASE("Vector move construction does not construct or destroy elements",
     }
 
     // 两个容器都析构后仍为零，不能对未构造的容量区域析构元素。
+    CHECK(Tracked::constructed == 0);
+    CHECK(Tracked::destroyed == 0);
+}
+
+TEST_CASE("Vector move assignment replaces reserved storage",
+          "[vector][move_assignment]")
+{
+    vector<int> source;
+    vector<int> destination;
+
+    // SECTION 分别运行四种容量组合；每次都会执行下方的赋值和共享断言。
+    // 本轮所有对象的 size 都是 0，具有容量不代表已经构造了元素。
+    SECTION("neither object owns storage")
+    {
+        CHECK(source.capacity() == 0);
+        CHECK(destination.capacity() == 0);
+    }
+    SECTION("only source owns storage")
+    {
+        source.reserve(4);
+    }
+    SECTION("only destination owns storage")
+    {
+        destination.reserve(9);
+    }
+    SECTION("both objects own storage")
+    {
+        source.reserve(4);
+        destination.reserve(9);
+    }
+
+    const auto expected_capacity = source.capacity();
+    auto& assigned = (destination = std::move(source));
+
+    // 赋值返回目标自身的左值引用；目标容量来自源对象，而非保留原容量。
+    CHECK(&assigned == &destination);
+    CHECK(destination.capacity() == expected_capacity);
+    CHECK(destination.size() == 0);
+    CHECK(destination.empty());
+
+    // 不同对象之间转移所有权后，源对象恢复本项目约定的零容量空状态。
+    CHECK(source.capacity() == 0);
+    CHECK(source.size() == 0);
+    CHECK(source.empty());
+}
+
+TEST_CASE("Vector objects remain reusable after repeated move assignment",
+          "[vector][move_assignment]")
+{
+    vector<int> source;
+    source.reserve(4);
+    vector<int> destination;
+    destination.reserve(9);
+
+    destination = std::move(source);
+
+    // 双方可以各自重新预留容量，不能继续共享同一分配块的所有权。
+    REQUIRE_NOTHROW(source.reserve(2));
+    CHECK(source.capacity() == 2);
+    CHECK(destination.capacity() == 4);
+    REQUIRE_NOTHROW(destination.reserve(12));
+    CHECK(source.capacity() == 2);
+    CHECK(source.size() == 0);
+    CHECK(source.empty());
+    CHECK(destination.capacity() == 12);
+    CHECK(destination.size() == 0);
+    CHECK(destination.empty());
+
+    // 再次赋值也必须替换目标当前的存储，不能只处理第一次赋值。
+    destination = std::move(source);
+    CHECK(destination.capacity() == 2);
+    CHECK(destination.size() == 0);
+    CHECK(destination.empty());
+    CHECK(source.capacity() == 0);
+    CHECK(source.size() == 0);
+    CHECK(source.empty());
+}
+
+TEST_CASE("Vector self move assignment preserves state",
+          "[vector][move_assignment]")
+{
+    vector<int> v;
+
+    SECTION("without storage")
+    {
+        CHECK(v.capacity() == 0);
+    }
+    SECTION("with reserved storage")
+    {
+        v.reserve(4);
+    }
+
+    const auto previous_capacity = v.capacity();
+    // 别名仍指向同一个对象。本项目规定自移动赋值不改变状态。
+    auto& alias = v;
+    auto& assigned = (v = std::move(alias));
+
+    CHECK(&assigned == &v);
+    CHECK(v.capacity() == previous_capacity);
+    CHECK(v.size() == 0);
+    CHECK(v.empty());
+
+    // 自移动后继续使用，检查是否遗留了错误的所有权状态。
+    REQUIRE_NOTHROW(v.reserve(previous_capacity + 3));
+    CHECK(v.capacity() == previous_capacity + 3);
+    CHECK(v.size() == 0);
+    CHECK(v.empty());
+}
+
+TEST_CASE("Vector move assignment supports either destruction order",
+          "[vector][move_assignment]")
+{
+    SECTION("destination is destroyed first")
+    {
+        vector<int> source;
+        source.reserve(4);
+
+        {
+            vector<int> destination;
+            destination.reserve(9);
+            destination = std::move(source);
+            CHECK(destination.capacity() == 4);
+            CHECK(source.capacity() == 0);
+        } // 目标释放接管的分配块，源对象仍存活。
+
+        REQUIRE_NOTHROW(source.reserve(2));
+        CHECK(source.capacity() == 2);
+        CHECK(source.size() == 0);
+        CHECK(source.empty());
+    }
+
+    SECTION("source is destroyed first")
+    {
+        vector<int> destination;
+        destination.reserve(9);
+
+        {
+            vector<int> source;
+            source.reserve(4);
+            destination = std::move(source);
+            CHECK(source.capacity() == 0);
+        } // 源对象析构不能释放已经交给目标的存储。
+
+        CHECK(destination.capacity() == 4);
+        REQUIRE_NOTHROW(destination.reserve(12));
+        CHECK(destination.capacity() == 12);
+        CHECK(destination.size() == 0);
+        CHECK(destination.empty());
+    }
+}
+
+TEST_CASE("Vector move assignment does not construct or destroy elements",
+          "[vector][move_assignment]")
+{
+    Tracked::constructed = 0;
+    Tracked::destroyed = 0;
+
+    {
+        vector<Tracked> source;
+        source.reserve(4);
+        vector<Tracked> destination;
+        destination.reserve(9);
+
+        destination = std::move(source);
+
+        // 目标原有的是原始存储，没有元素可析构；接管源存储也不构造元素。
+        CHECK(destination.capacity() == 4);
+        CHECK(destination.size() == 0);
+        CHECK(destination.empty());
+        CHECK(source.capacity() == 0);
+        CHECK(source.size() == 0);
+        CHECK(source.empty());
+        CHECK(Tracked::constructed == 0);
+        CHECK(Tracked::destroyed == 0);
+    }
+
+    // 这些计数只验证元素生命周期，不能单独证明目标旧存储没有泄漏。
     CHECK(Tracked::constructed == 0);
     CHECK(Tracked::destroyed == 0);
 }
