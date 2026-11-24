@@ -121,35 +121,32 @@ public:
 
     bool empty() const noexcept { return size_==0; }
 
-    T& operator[](std::size_t i) noexcept
-    {
-        return *(data_+i);
-    }
+    T& operator[](std::size_t i) noexcept { return *(data_+i); }
 
-    const T& operator[](std::size_t i) const noexcept
-    {
-        return *(data_+i);
-    }
+    const T& operator[](std::size_t i) const noexcept { return *(data_+i); }
 
-    T& front() noexcept
-    {
-        return *data_;
-    }
+    T& front() noexcept { return *data_; }
 
-    const T& front() const noexcept
-    {
-        return *data_;
-    }
+    const T& front() const noexcept { return *data_; }
 
-    T& back() noexcept
-    {
-        return *(data_+size_-1);
-    }
+    T& back() noexcept { return *(data_+size_-1); }
 
-    const T& back() const noexcept
-    {
-        return *(data_+size_-1);
-    }
+    const T& back() const noexcept { return *(data_+size_-1); }
+
+    using iterator=T*;
+    using const_iterator=const T*;
+
+    iterator begin() noexcept { return data_; }
+
+    const_iterator begin() const noexcept { return data_; }
+
+    iterator end() noexcept { return data_+size_; }
+
+    const_iterator end() const noexcept { return data_+size_; }
+
+    const_iterator cbegin() const noexcept { return data_; }
+    
+    const_iterator cend() const noexcept { return data_+size_; }
 
 public:
     void reserve(std::size_t n)

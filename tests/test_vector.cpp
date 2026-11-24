@@ -1,8 +1,11 @@
 #include<catch2/catch_test_macros.hpp>
 #include<mycppcontainer/vector.hpp>
+#include<algorithm>
 #include<cstddef>
+#include<iterator>
 #include<limits>
 #include<memory>
+#include<numeric>
 #include<span>
 #include<stdexcept>
 #include<type_traits>
@@ -185,8 +188,8 @@ static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>()[0]),
 static_assert(noexcept(std::declval<vector<int>&>()[0]));
 static_assert(noexcept(std::declval<const vector<int>&>()[0]));
 
-// 本轮只借用已有元素和存储：普通容器返回可写引用/指针，const 容器返回只读版本。
-// front/back 要求非空；decltype 和 noexcept 不执行访问。接口实现前预期无法编译。
+// 访问接口只借用已有元素和存储：普通容器返回可写版本，const 容器返回只读版本。
+// front/back 要求非空；decltype 和 noexcept 不执行访问。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().front()), int&>);
 static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().front()),
                              const int&>);
@@ -202,6 +205,31 @@ static_assert(noexcept(std::declval<vector<int>&>().back()));
 static_assert(noexcept(std::declval<const vector<int>&>().back()));
 static_assert(noexcept(std::declval<vector<int>&>().data()));
 static_assert(noexcept(std::declval<const vector<int>&>().data()));
+
+// 本轮直接把指针作为迭代器，不需要自定义迭代器类；缺少接口时预期无法编译。
+static_assert(std::is_same_v<vector<int>::iterator, int*>);
+static_assert(std::is_same_v<vector<int>::const_iterator, const int*>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().begin()), int*>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().end()), int*>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().begin()),
+                             const int*>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().end()),
+                             const int*>);
+// cbegin/cend 即使经由可写容器调用，也只能得到指向 const 元素的迭代器。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().cbegin()), const int*>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().cend()), const int*>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().cbegin()),
+                             const int*>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().cend()),
+                             const int*>);
+static_assert(noexcept(std::declval<vector<int>&>().begin()));
+static_assert(noexcept(std::declval<vector<int>&>().end()));
+static_assert(noexcept(std::declval<const vector<int>&>().begin()));
+static_assert(noexcept(std::declval<const vector<int>&>().end()));
+static_assert(noexcept(std::declval<vector<int>&>().cbegin()));
+static_assert(noexcept(std::declval<vector<int>&>().cend()));
+static_assert(noexcept(std::declval<const vector<int>&>().cbegin()));
+static_assert(noexcept(std::declval<const vector<int>&>().cend()));
 
 // clear 只结束元素生命周期，返回 void；沿用元素析构不抛异常的前提。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().clear()), void>);
@@ -2914,4 +2942,217 @@ TEST_CASE("Vector accessors preserve move-only element ownership",
     CHECK(cv.data()[1].get() == last_owned);
     CHECK(v.size() == 2);
     CHECK(v.capacity() == 4);
+}
+
+TEST_CASE("Vector empty iterator ranges contain no elements",
+          "[vector][iteration]")
+{
+    vector<int> v;
+    SECTION("default empty vector") {}
+    SECTION("reserved empty vector") { v.reserve(4); }
+    SECTION("cleared vector with retained storage")
+    {
+        v.reserve(4);
+        v.emplace_back(7);
+        v.clear();
+    }
+    SECTION("popped-to-empty vector")
+    {
+        v.reserve(4);
+        v.emplace_back(7);
+        v.pop_back();
+    }
+    SECTION("moved-from vector")
+    {
+        v.reserve(4);
+        v.emplace_back(7);
+        vector<int> destination(std::move(v));
+        REQUIRE(destination.size() == 1);
+    }
+    const auto& cv = v;
+    REQUIRE(v.empty());
+    REQUIRE(v.begin() == v.data());
+    REQUIRE(v.end() == v.begin());
+    REQUIRE(cv.begin() == cv.data());
+    REQUIRE(cv.end() == cv.begin());
+    REQUIRE(v.cbegin() == cv.begin());
+    REQUIRE(v.cend() == cv.end());
+    REQUIRE(cv.cbegin() == cv.begin());
+    REQUIRE(cv.cend() == cv.end());
+
+    // 空区间只比较边界；不解引用、不递增，也不把备用容量当成元素。
+    int visits = 0;
+    for ([[maybe_unused]] auto& element : v) { ++visits; }
+    for ([[maybe_unused]] const auto& element : cv) { ++visits; }
+    for (auto it = v.cbegin(); it != v.cend(); ++it) { ++visits; }
+    CHECK(visits == 0);
+}
+
+TEST_CASE("Vector range iteration visits and modifies only live elements",
+          "[vector][iteration]")
+{
+    vector<int> v;
+    v.reserve(8);
+    v.emplace_back(7);
+    v.emplace_back(11);
+    v.emplace_back(13);
+    const auto& cv = v;
+    REQUIRE(v.begin() == v.data());
+    REQUIRE(v.end() == v.data() + v.size());
+    REQUIRE(cv.begin() == cv.data());
+    REQUIRE(cv.end() == cv.data() + cv.size());
+    REQUIRE(v.cbegin() == cv.begin());
+    REQUIRE(v.cend() == cv.end());
+
+    std::size_t index = 0;
+    for (auto& element : v)
+    {
+        REQUIRE(index < v.size());
+        CHECK(std::addressof(element) == std::addressof(v[index]));
+        element += 10;
+        ++index;
+    }
+    CHECK(index == 3);
+    CHECK(v[0] == 17);
+    CHECK(v[1] == 21);
+    CHECK(v[2] == 23);
+    int sum = 0;
+    for (const auto& element : cv) { sum += element; }
+    CHECK(sum == 61);
+    sum = 0;
+    for (auto it = v.cbegin(); it != v.cend(); ++it) { sum += *it; }
+    CHECK(sum == 61);
+    CHECK(v.size() == 3);
+    CHECK(v.capacity() == 8);
+    // end 指向有效元素范围之后的位置，仅用作边界，不可解引用。
+}
+
+TEST_CASE("Vector pointer iterators work with standard algorithms",
+          "[vector][iteration][algorithms]")
+{
+    vector<int> v;
+    v.reserve(8);
+    v.emplace_back(9);
+    v.emplace_back(1);
+    v.emplace_back(5);
+    const auto* storage = v.data();
+    REQUIRE(v.begin() == v.data());
+    REQUIRE(v.end() == v.data() + v.size());
+
+    // 排序的范围只含三个活元素；不排序未初始化的备用容量。
+    std::sort(v.begin(), v.end());
+    CHECK(v[0] == 1);
+    CHECK(v[1] == 5);
+    CHECK(v[2] == 9);
+    const auto& cv = v;
+    REQUIRE(cv.begin() == cv.data());
+    REQUIRE(cv.end() == cv.data() + cv.size());
+    REQUIRE(cv.cbegin() == cv.begin());
+    REQUIRE(cv.cend() == cv.end());
+    CHECK(std::find(cv.cbegin(), cv.cend(), 5) == v.data() + 1);
+    CHECK(std::find(cv.cbegin(), cv.cend(), 99) == cv.cend());
+    CHECK(std::accumulate(cv.begin(), cv.end(), 0) == 15);
+    CHECK(std::distance(cv.cbegin(), cv.cend()) == 3);
+    CHECK(v.data() == storage);
+    CHECK(v.size() == 3);
+    CHECK(v.capacity() == 8);
+}
+
+TEST_CASE("Vector iteration does not copy or change element lifetimes",
+          "[vector][iteration][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> v;
+        v.reserve(5);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        const auto& cv = v;
+        REQUIRE(v.begin() == v.data());
+        REQUIRE(v.end() == v.data() + v.size());
+        REQUIRE(cv.begin() == cv.data());
+        REQUIRE(cv.end() == cv.data() + cv.size());
+
+        // 用引用遍历：迭代器访问已有对象；不要把 for(auto element : v) 的复制混进来。
+        CopyProbe::throw_on_copy = true;
+        for (auto& element : v) { ++element.value; }
+        int sum = 0;
+        for (const auto& element : cv) { sum += element.value; }
+        CopyProbe::throw_on_copy = false;
+        CHECK(sum == 20);
+        CHECK(v[0].value == 8);
+        CHECK(v[1].value == 12);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 2);
+        CHECK(CopyProbe::destroyed == 0);
+        CHECK(v.size() == 2);
+        CHECK(v.capacity() == 5);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 2);
+}
+
+TEST_CASE("Vector iteration preserves move-only element ownership",
+          "[vector][iteration][lifetime]")
+{
+    vector<std::unique_ptr<int>> v;
+    v.reserve(4);
+    v.emplace_back(std::make_unique<int>(7));
+    v.emplace_back(std::make_unique<int>(11));
+    const auto* first_owned = v[0].get();
+    const auto* last_owned = v[1].get();
+    REQUIRE(v.begin() == v.data());
+    REQUIRE(v.end() == v.data() + v.size());
+    for (auto& owner : v)
+    {
+        REQUIRE(owner != nullptr);
+        ++*owner;
+    }
+    const auto& cv = v;
+    REQUIRE(cv.begin() == cv.data());
+    REQUIRE(cv.end() == cv.data() + cv.size());
+    int sum = 0;
+    for (const auto& owner : cv)
+    {
+        REQUIRE(owner != nullptr);
+        sum += *owner;
+    }
+    CHECK(sum == 20);
+    CHECK(v[0].get() == first_owned);
+    CHECK(v[1].get() == last_owned);
+    CHECK(v.size() == 2);
+    CHECK(v.capacity() == 4);
+}
+
+TEST_CASE("Vector iterator endpoints follow size changes and ownership transfer",
+          "[vector][iteration]")
+{
+    vector<int> v;
+    v.reserve(4);
+    v.emplace_back(7);
+    const auto* first = v.data();
+    CHECK(v.begin() == first);
+    CHECK(v.end() == first + 1);
+
+    // 容量内追加保留已有元素地址，但旧 end 不再表示当前的尾后位置，必须重新获取。
+    v.emplace_back(11);
+    CHECK(v.begin() == first);
+    CHECK(v.end() == first + 2);
+    v.pop_back();
+    CHECK(v.begin() == first);
+    CHECK(v.end() == first + 1);
+    v.clear();
+    CHECK(v.begin() == first);
+    CHECK(v.end() == v.begin());
+
+    v.emplace_back(13);
+    vector<int> destination(std::move(v));
+    CHECK(v.begin() == nullptr);
+    CHECK(v.end() == v.begin());
+    CHECK(v.cbegin() == v.begin());
+    CHECK(v.cend() == v.end());
+    CHECK(destination.begin() == first);
+    CHECK(destination.end() == first + 1);
+    REQUIRE(destination.size() == 1);
+    CHECK(*destination.begin() == 13);
 }
