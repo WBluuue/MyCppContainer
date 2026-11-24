@@ -140,8 +140,12 @@ static_assert(!std::is_default_constructible_v<NoDefault>);
 static_assert(!std::is_default_constructible_v<CopyProbe>);
 static_assert(!std::is_copy_assignable_v<CopyProbe>);
 
-// 所有权接口保持无异常移动构造和移动赋值；复制操作仍然禁止。
-static_assert(!std::is_copy_constructible_v<vector<int>>);
+// 本轮开放拷贝构造，并按 T 的拷贝能力约束接口；拷贝赋值仍然禁止。
+// 尚未实现新接口时，这些断言和下方复制用例预期无法编译。
+static_assert(std::is_copy_constructible_v<vector<int>>);
+static_assert(std::is_copy_constructible_v<vector<CopyProbe>>);
+static_assert(!std::is_nothrow_copy_constructible_v<vector<int>>);
+static_assert(!std::is_copy_constructible_v<vector<std::unique_ptr<int>>>);
 static_assert(!std::is_copy_assignable_v<vector<int>>);
 static_assert(std::is_nothrow_move_constructible_v<vector<int>>);
 static_assert(std::is_nothrow_move_assignable_v<vector<int>>);
@@ -2013,4 +2017,229 @@ TEST_CASE("Vector growing append copies old elements when moving could throw",
     }
     CHECK(Probe::live == 0);
     CHECK(Probe::destroyed == 5);
+}
+
+TEST_CASE("Vector copy construction of empty sources keeps destination unallocated",
+          "[vector][copy_construction]")
+{
+    Tracked::constructed = 0;
+    Tracked::destroyed = 0;
+    {
+        vector<Tracked> source;
+        SECTION("default empty source")
+        {
+            CHECK(source.capacity() == 0);
+        }
+        SECTION("empty source with reserved capacity")
+        {
+            source.reserve(5);
+        }
+        const auto old_capacity = source.capacity();
+        const auto& original = source;
+        vector<Tracked> destination(original);
+
+        // 本项目选择只为有效元素分配容量；源的备用容量不属于要复制的值。
+        CHECK(destination.empty());
+        CHECK(destination.size() == 0);
+        CHECK(destination.capacity() == 0);
+        CHECK(source.empty());
+        CHECK(source.size() == 0);
+        CHECK(source.capacity() == old_capacity);
+        CHECK(Tracked::constructed == 0);
+        CHECK(Tracked::destroyed == 0);
+    }
+    CHECK(Tracked::destroyed == 0);
+}
+
+TEST_CASE("Vector copy construction creates independent storage and values",
+          "[vector][copy_construction]")
+{
+    vector<int> source;
+    source.reserve(6);
+    source.emplace_back(7);
+    source.emplace_back(11);
+    source.emplace_back(13);
+    const auto& original = source;
+    vector<int> destination(original);
+
+    REQUIRE(destination.size() == 3);
+    CHECK(destination.capacity() == 3);
+    CHECK(destination[0] == 7);
+    CHECK(destination[1] == 11);
+    CHECK(destination[2] == 13);
+    CHECK(source.size() == 3);
+    CHECK(source.capacity() == 6);
+    CHECK(std::addressof(destination[0]) != std::addressof(source[0]));
+
+    // 两边的元素各自拥有生命周期，修改或清空其中一边不能改变另一边。
+    destination[1] = 42;
+    CHECK(source[1] == 11);
+    source[2] = 99;
+    CHECK(destination[2] == 13);
+    source.clear();
+    REQUIRE(destination.size() == 3);
+    CHECK(destination[0] == 7);
+    CHECK(destination[1] == 42);
+    CHECK(destination[2] == 13);
+
+    source.emplace_back(17);
+    destination.emplace_back(19);
+    REQUIRE(source.size() == 1);
+    REQUIRE(destination.size() == 4);
+    CHECK(source[0] == 17);
+    CHECK(source.capacity() == 6);
+    CHECK(destination[3] == 19);
+    CHECK(destination.capacity() == 6);
+}
+
+TEST_CASE("Vector copy construction copies only live nonassignable elements",
+          "[vector][copy_construction][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> source;
+        source.reserve(5);
+        source.emplace_back(7);
+        source.emplace_back(11);
+        source.emplace_back(13);
+        REQUIRE(CopyProbe::live == 3);
+        {
+            // CopyProbe 无默认构造、无赋值操作：必须在新存储中逐个拷贝构造。
+            const auto& original = source;
+            vector<CopyProbe> destination(original);
+            REQUIRE(destination.size() == 3);
+            CHECK(destination.capacity() == 3);
+            CHECK(destination[0].value == 7);
+            CHECK(destination[1].value == 11);
+            CHECK(destination[2].value == 13);
+            CHECK(CopyProbe::copies == 3);
+            CHECK(CopyProbe::live == 6);
+            CHECK(CopyProbe::destroyed == 0);
+        }
+
+        // 副本先析构，源的三个对象仍然有效。
+        CHECK(CopyProbe::live == 3);
+        CHECK(CopyProbe::destroyed == 3);
+        REQUIRE(source.size() == 3);
+        CHECK(source.capacity() == 5);
+        CHECK(source[0].value == 7);
+        CHECK(source[1].value == 11);
+        CHECK(source[2].value == 13);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 6);
+}
+
+TEST_CASE("Vector copied destination outlives its source",
+          "[vector][copy_construction][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        auto destination = [] {
+            vector<CopyProbe> source;
+            source.reserve(4);
+            source.emplace_back(7);
+            source.emplace_back(11);
+            const auto& original = source;
+            // 显式从 const 左值构造副本；lambda 返回后源对象立即析构。
+            return vector<CopyProbe>(original);
+        }();
+
+        REQUIRE(destination.size() == 2);
+        CHECK(destination.capacity() == 2);
+        CHECK(destination[0].value == 7);
+        CHECK(destination[1].value == 11);
+        CHECK(CopyProbe::copies == 2);
+        CHECK(CopyProbe::live == 2);
+        CHECK(CopyProbe::destroyed == 2);
+        destination[0].value = 42;
+        CHECK(destination[0].value == 42);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 4);
+}
+
+TEST_CASE("Vector failed copy construction destroys only the completed prefix",
+          "[vector][copy_construction][exception]")
+{
+    int copied_prefix = 0;
+    SECTION("first element copy throws") { copied_prefix = 0; }
+    SECTION("second element copy throws") { copied_prefix = 1; }
+    SECTION("third element copy throws") { copied_prefix = 2; }
+
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> source;
+        source.reserve(5);
+        source.emplace_back(7);
+        source.emplace_back(11);
+        source.emplace_back(13);
+        const auto& original = source;
+        const auto* first = std::addressof(source[0]);
+
+        CopyProbe::copies_before_throw = copied_prefix;
+        REQUIRE_THROWS_AS(vector<CopyProbe>(original), std::runtime_error);
+        CopyProbe::copies_before_throw = -1;
+
+        // Vector 构造失败时不会调用它自身的析构函数，已构造前缀必须显式回收。
+        // 失败的那个元素未完成构造，不能对它调用析构；源对象也不能被销毁。
+        REQUIRE(source.size() == 3);
+        CHECK(source.capacity() == 5);
+        CHECK(std::addressof(source[0]) == first);
+        CHECK(source[0].value == 7);
+        CHECK(source[1].value == 11);
+        CHECK(source[2].value == 13);
+        CHECK(CopyProbe::live == 3);
+        CHECK(CopyProbe::copies == copied_prefix);
+        CHECK(CopyProbe::destroyed == copied_prefix);
+
+        {
+            vector<CopyProbe> retry(original);
+            REQUIRE(retry.size() == 3);
+            CHECK(retry.capacity() == 3);
+            CHECK(retry[0].value == 7);
+            CHECK(retry[1].value == 11);
+            CHECK(retry[2].value == 13);
+            CHECK(CopyProbe::live == 6);
+            CHECK(CopyProbe::copies == copied_prefix + 3);
+        }
+        CHECK(CopyProbe::live == 3);
+        CHECK(CopyProbe::destroyed == copied_prefix + 3);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == copied_prefix + 6);
+}
+
+TEST_CASE("Vector copy construction never moves from source elements",
+          "[vector][copy_construction][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        vector<Probe> source;
+        source.reserve(4);
+        source.emplace_back(7);
+        source.emplace_back(11);
+        const auto& original = source;
+        {
+            // 即使移动是 noexcept，复制容器也必须拷贝，不能套用搬迁的选择策略。
+            vector<Probe> destination(original);
+            REQUIRE(destination.size() == 2);
+            CHECK(destination.capacity() == 2);
+            CHECK(destination[0].value == 7);
+            CHECK(destination[1].value == 11);
+            REQUIRE(source.size() == 2);
+            CHECK(source.capacity() == 4);
+            CHECK(source[0].value == 7);
+            CHECK(source[1].value == 11);
+            CHECK(Probe::copies == 2);
+            CHECK(Probe::moves == 0);
+            CHECK(Probe::live == 4);
+            CHECK(Probe::destroyed == 0);
+        }
+        CHECK(Probe::live == 2);
+        CHECK(Probe::destroyed == 2);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 4);
 }

@@ -4,6 +4,7 @@
 #include<memory>
 #include<stdexcept>
 #include<utility>
+#include<type_traits>
 
 namespace mycppcontainer
 {
@@ -24,7 +25,35 @@ private:
 public:
     Vector()=default;
 
-    Vector(const Vector& v)=delete;
+    Vector(const Vector& other)
+        requires std::is_copy_constructible_v<T>
+    {
+        if(other.empty())
+        {
+            return ;
+        }
+        
+        data_=Trait::allocate(alloc,other.size_);
+        for(std::size_t i=0;i<other.size_;++i)
+        {
+            try
+            {
+                Trait::construct(alloc,data_+i,other[i]);
+            }
+            catch(...)
+            {
+                for(std::size_t j=0;j<i;++j)
+                {
+                    Trait::destroy(alloc,data_+j);
+                }
+                Trait::deallocate(alloc,data_,other.size_);
+                data_=nullptr;
+                throw;
+            }
+        }
+        size_=other.size_;
+        capacity_=other.size_;
+    }
 
     Vector(Vector&& other) noexcept
         :data_(other.data_),size_(other.size_),capacity_(other.capacity_)
