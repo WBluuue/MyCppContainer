@@ -32,7 +32,7 @@ public:
         {
             return ;
         }
-        
+
         data_=Trait::allocate(alloc,other.size_);
         for(std::size_t i=0;i<other.size_;++i)
         {
@@ -63,7 +63,16 @@ public:
         other.capacity_=0;
     }
 
-    Vector& operator=(const Vector& rhs)=delete;
+    Vector& operator=(const Vector& rhs)
+        requires std::is_copy_constructible_v<T>
+    {
+        if(this!=(&rhs))
+        {
+            auto newVector(rhs);
+            *this=std::move(newVector);
+        }
+        return *this;
+    }
 
     Vector& operator=(Vector&& rhs) noexcept
     {

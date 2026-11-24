@@ -134,21 +134,47 @@ struct RelocationProbe {
     }
 };
 
+// const 容器里的指针成员仍可能解引用成 T&；用两个拷贝重载检查源元素的 const 性。
+struct ConstCopyProbe {
+    inline static int const_copies = 0;
+    inline static int mutable_copies = 0;
+
+    int value;
+    explicit ConstCopyProbe(int v) : value(v) {}
+    ConstCopyProbe(const ConstCopyProbe& other) : value(other.value)
+    {
+        ++const_copies;
+    }
+    ConstCopyProbe(ConstCopyProbe& other) : value(other.value)
+    {
+        ++mutable_copies;
+        other.value = -1;
+    }
+    ConstCopyProbe& operator=(const ConstCopyProbe&) = delete;
+};
+
 } // namespace
 
 static_assert(!std::is_default_constructible_v<NoDefault>);
 static_assert(!std::is_default_constructible_v<CopyProbe>);
 static_assert(!std::is_copy_assignable_v<CopyProbe>);
 
-// 本轮开放拷贝构造，并按 T 的拷贝能力约束接口；拷贝赋值仍然禁止。
-// 尚未实现新接口时，这些断言和下方复制用例预期无法编译。
+// 拷贝构造和拷贝赋值均依据 T 的拷贝构造能力约束接口。
+// 元素不可赋值不妨碍容器通过独立副本替换旧内容。
 static_assert(std::is_copy_constructible_v<vector<int>>);
 static_assert(std::is_copy_constructible_v<vector<CopyProbe>>);
 static_assert(!std::is_nothrow_copy_constructible_v<vector<int>>);
 static_assert(!std::is_copy_constructible_v<vector<std::unique_ptr<int>>>);
-static_assert(!std::is_copy_assignable_v<vector<int>>);
+static_assert(std::is_copy_assignable_v<vector<int>>);
+static_assert(std::is_copy_assignable_v<vector<CopyProbe>>);
+static_assert(!std::is_copy_assignable_v<vector<std::unique_ptr<int>>>);
+static_assert(!std::is_nothrow_copy_assignable_v<vector<int>>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>() =
+                                    std::declval<const vector<int>&>()), vector<int>&>);
 static_assert(std::is_nothrow_move_constructible_v<vector<int>>);
 static_assert(std::is_nothrow_move_assignable_v<vector<int>>);
+static_assert(std::is_nothrow_move_constructible_v<vector<std::unique_ptr<int>>>);
+static_assert(std::is_nothrow_move_assignable_v<vector<std::unique_ptr<int>>>);
 
 // 下标访问返回元素引用；const 容器只提供 const 引用。
 // decltype 和 noexcept 中的表达式不会实际执行，不会访问空容器。
@@ -161,6 +187,11 @@ static_assert(noexcept(std::declval<const vector<int>&>()[0]));
 // clear 只结束元素生命周期，返回 void；沿用元素析构不抛异常的前提。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().clear()), void>);
 static_assert(noexcept(std::declval<vector<int>&>().clear()));
+
+// pop_back 的前置条件是非空，返回 void；沿用元素析构不抛异常的前提。
+// 这里只检查接口，不实际调用；接口实现前这些断言预期无法编译。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().pop_back()), void>);
+static_assert(noexcept(std::declval<vector<int>&>().pop_back()));
 
 // 右值追加返回 void；容量检查与元素构造都可能抛异常，接口不能承诺 noexcept。
 // 表达式检查本身不能区分两个重载；下方移动计数和 unique_ptr 用例验证实际行为。
@@ -2242,4 +2273,428 @@ TEST_CASE("Vector copy construction never moves from source elements",
     }
     CHECK(Probe::live == 0);
     CHECK(Probe::destroyed == 4);
+}
+
+TEST_CASE("Vector copy assignment replaces values with independent storage",
+          "[vector][copy_assignment]")
+{
+    vector<int> source;
+    source.reserve(6);
+    source.emplace_back(7);
+    source.emplace_back(11);
+    source.emplace_back(13);
+    const auto& original = source;
+    const auto* source_first = std::addressof(source[0]);
+    vector<int> destination;
+
+    SECTION("default empty destination") {}
+    SECTION("reserved empty destination") { destination.reserve(8); }
+    SECTION("destination capacity is smaller than source size")
+    {
+        destination.reserve(1);
+        destination.emplace_back(99);
+    }
+    SECTION("destination has more live elements and spare capacity")
+    {
+        destination.reserve(8);
+        destination.emplace_back(91);
+        destination.emplace_back(92);
+        destination.emplace_back(93);
+        destination.emplace_back(94);
+    }
+
+    auto& result = (destination = original);
+    CHECK(std::addressof(result) == std::addressof(destination));
+    REQUIRE(destination.size() == 3);
+    // 本轮统一替换存储，容量等于源 size；暂不复用目标原有的较大容量。
+    CHECK(destination.capacity() == 3);
+    CHECK(destination[0] == 7);
+    CHECK(destination[1] == 11);
+    CHECK(destination[2] == 13);
+    CHECK(std::addressof(destination[0]) != source_first);
+    REQUIRE(source.size() == 3);
+    CHECK(source.capacity() == 6);
+    CHECK(std::addressof(source[0]) == source_first);
+    CHECK(source[0] == 7);
+    CHECK(source[1] == 11);
+    CHECK(source[2] == 13);
+
+    destination[0] = 42;
+    source[1] = 99;
+    CHECK(source[0] == 7);
+    CHECK(destination[1] == 11);
+    source.clear();
+    REQUIRE(destination.size() == 3);
+    CHECK(destination[0] == 42);
+    CHECK(destination[2] == 13);
+}
+
+TEST_CASE("Vector copy assignment releases old elements and outlives source",
+          "[vector][copy_assignment][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> destination;
+        destination.reserve(8);
+        destination.emplace_back(91);
+        destination.emplace_back(92);
+        {
+            vector<CopyProbe> source;
+            source.reserve(5);
+            source.emplace_back(7);
+            source.emplace_back(11);
+            source.emplace_back(13);
+            const auto& original = source;
+
+            // CopyProbe 无默认构造且不可赋值；容器赋值只能依赖其拷贝构造能力。
+            destination = original;
+            REQUIRE(destination.size() == 3);
+            CHECK(destination.capacity() == 3);
+            CHECK(destination[0].value == 7);
+            CHECK(destination[1].value == 11);
+            CHECK(destination[2].value == 13);
+            CHECK(CopyProbe::copies == 3);
+            CHECK(CopyProbe::live == 6);
+            CHECK(CopyProbe::destroyed == 2); // 仅目标原来的两个元素被销毁。
+        }
+        // 源先析构，目标独立拥有三个新元素，不能悬空或重复释放。
+        CHECK(CopyProbe::live == 3);
+        CHECK(CopyProbe::destroyed == 5);
+        REQUIRE(destination.size() == 3);
+        CHECK(destination[0].value == 7);
+        CHECK(destination[1].value == 11);
+        CHECK(destination[2].value == 13);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 8);
+}
+
+TEST_CASE("Vector copy assignment from empty source releases destination storage",
+          "[vector][copy_assignment][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> source;
+        SECTION("default empty source") {}
+        SECTION("reserved empty source") { source.reserve(4); }
+        const auto source_capacity = source.capacity();
+        const auto& original = source;
+        vector<CopyProbe> destination;
+        destination.reserve(5);
+        destination.emplace_back(91);
+        destination.emplace_back(92);
+
+        auto& result = (destination = original);
+        CHECK(std::addressof(result) == std::addressof(destination));
+        CHECK(destination.empty());
+        CHECK(destination.size() == 0);
+        CHECK(destination.capacity() == 0);
+        CHECK(source.empty());
+        CHECK(source.capacity() == source_capacity);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 0);
+        CHECK(CopyProbe::destroyed == 2);
+
+        // 被置空的目标仍可重新使用；元素计数不能单独证明原始存储没有泄漏。
+        destination.emplace_back(17);
+        REQUIRE(destination.size() == 1);
+        CHECK(destination.capacity() == 1);
+        CHECK(destination[0].value == 17);
+        CHECK(CopyProbe::live == 1);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 3);
+}
+
+TEST_CASE("Vector self copy assignment is a no-op even when copying would throw",
+          "[vector][copy_assignment][exception]")
+{
+    CopyProbe::reset();
+    int final_destructions = 0;
+    {
+        vector<CopyProbe> v;
+        SECTION("default empty vector") {}
+        SECTION("reserved empty vector") { v.reserve(5); }
+        SECTION("nonempty vector with spare capacity")
+        {
+            v.reserve(5);
+            v.emplace_back(7);
+            v.emplace_back(11);
+            final_destructions = 2;
+        }
+        const auto old_size = v.size();
+        const auto old_capacity = v.capacity();
+        const auto* first = v.empty() ? nullptr : std::addressof(v[0]);
+        const auto& self = v;
+
+        // 自赋值必须提前识别；不应复制元素、收缩容量或触发本可避免的异常。
+        CopyProbe::throw_on_copy = true;
+        REQUIRE_NOTHROW(v = self);
+        CopyProbe::throw_on_copy = false;
+        REQUIRE(v.size() == old_size);
+        CHECK(v.capacity() == old_capacity);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::destroyed == 0);
+        CHECK(CopyProbe::live == final_destructions);
+        if (old_size != 0)
+        {
+            CHECK(std::addressof(v[0]) == first);
+            CHECK(v[0].value == 7);
+            CHECK(v[1].value == 11);
+        }
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == final_destructions);
+}
+
+TEST_CASE("Vector failed copy assignment preserves both vectors and allows retry",
+          "[vector][copy_assignment][exception]")
+{
+    int copied_prefix = 0;
+    SECTION("first copy throws") { copied_prefix = 0; }
+    SECTION("middle copy throws") { copied_prefix = 1; }
+    SECTION("last copy throws") { copied_prefix = 2; }
+
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> source;
+        source.reserve(5);
+        source.emplace_back(7);
+        source.emplace_back(11);
+        source.emplace_back(13);
+        vector<CopyProbe> destination;
+        destination.reserve(8);
+        destination.emplace_back(91);
+        destination.emplace_back(92);
+        const auto& original = source;
+        const auto* source_first = std::addressof(source[0]);
+        const auto* destination_first = std::addressof(destination[0]);
+
+        CopyProbe::copies_before_throw = copied_prefix;
+        REQUIRE_THROWS_AS(destination = original, std::runtime_error);
+        CopyProbe::copies_before_throw = -1;
+
+        // 强异常保证：新副本失败时，只回收它的已构造前缀；目标旧状态完全保留。
+        REQUIRE(destination.size() == 2);
+        CHECK(destination.capacity() == 8);
+        CHECK(std::addressof(destination[0]) == destination_first);
+        CHECK(destination[0].value == 91);
+        CHECK(destination[1].value == 92);
+        REQUIRE(source.size() == 3);
+        CHECK(source.capacity() == 5);
+        CHECK(std::addressof(source[0]) == source_first);
+        CHECK(source[0].value == 7);
+        CHECK(source[1].value == 11);
+        CHECK(source[2].value == 13);
+        CHECK(CopyProbe::live == 5);
+        CHECK(CopyProbe::copies == copied_prefix);
+        CHECK(CopyProbe::destroyed == copied_prefix);
+
+        // 失败后仍能重试；成功提交时才释放目标原来的两个元素。
+        destination = original;
+        REQUIRE(destination.size() == 3);
+        CHECK(destination.capacity() == 3);
+        CHECK(destination[0].value == 7);
+        CHECK(destination[1].value == 11);
+        CHECK(destination[2].value == 13);
+        CHECK(std::addressof(destination[0]) != source_first);
+        CHECK(CopyProbe::live == 6);
+        CHECK(CopyProbe::copies == copied_prefix + 3);
+        CHECK(CopyProbe::destroyed == copied_prefix + 2);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == copied_prefix + 8);
+}
+
+TEST_CASE("Vector copy assignment never moves from source elements",
+          "[vector][copy_assignment][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        vector<Probe> source;
+        source.reserve(4);
+        source.emplace_back(7);
+        source.emplace_back(11);
+        vector<Probe> destination;
+        destination.reserve(5);
+        destination.emplace_back(99);
+        const auto& original = source;
+
+        // 源元素即使可 noexcept 移动，也不能在复制时被移动走。
+        destination = original;
+        REQUIRE(destination.size() == 2);
+        CHECK(destination.capacity() == 2);
+        CHECK(destination[0].value == 7);
+        CHECK(destination[1].value == 11);
+        REQUIRE(source.size() == 2);
+        CHECK(source.capacity() == 4);
+        CHECK(source[0].value == 7);
+        CHECK(source[1].value == 11);
+        CHECK(Probe::copies == 2);
+        CHECK(Probe::moves == 0);
+        CHECK(Probe::live == 4);
+        CHECK(Probe::destroyed == 1);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
+}
+
+TEST_CASE("Vector copy assignment copies elements through const access",
+          "[vector][copy_assignment]")
+{
+    ConstCopyProbe::const_copies = 0;
+    ConstCopyProbe::mutable_copies = 0;
+    vector<ConstCopyProbe> source;
+    source.reserve(4);
+    source.emplace_back(7);
+    source.emplace_back(11);
+    vector<ConstCopyProbe> destination;
+    destination.reserve(3);
+    destination.emplace_back(99);
+    const auto& original = source;
+
+    destination = original;
+    REQUIRE(destination.size() == 2);
+    CHECK(destination.capacity() == 2);
+    CHECK(destination[0].value == 7);
+    CHECK(destination[1].value == 11);
+    REQUIRE(source.size() == 2);
+    CHECK(source.capacity() == 4);
+    CHECK(source[0].value == 7);
+    CHECK(source[1].value == 11);
+    CHECK(ConstCopyProbe::const_copies == 2);
+    CHECK(ConstCopyProbe::mutable_copies == 0);
+}
+
+TEST_CASE("Vector pop_back removes last element and preserves earlier references",
+          "[vector][pop_back]")
+{
+    vector<int> v;
+    v.reserve(5);
+    v.emplace_back(7);
+    v.emplace_back(11);
+    v.emplace_back(13);
+    const auto* first = std::addressof(v[0]);
+    const auto* second = std::addressof(v[1]);
+
+    // 删除的是 size - 1 处的活对象，不是 capacity - 1 处的未初始化存储。
+    v.pop_back();
+    REQUIRE(v.size() == 2);
+    CHECK(v.capacity() == 5);
+    CHECK(v[0] == 7);
+    CHECK(v[1] == 11);
+    CHECK(std::addressof(v[0]) == first);
+    CHECK(std::addressof(v[1]) == second);
+
+    v.pop_back();
+    REQUIRE(v.size() == 1);
+    CHECK(v.capacity() == 5);
+    CHECK(v[0] == 7);
+    CHECK(std::addressof(v[0]) == first);
+
+    v.pop_back();
+    CHECK(v.empty());
+    CHECK(v.size() == 0);
+    CHECK(v.capacity() == 5);
+    // 已删除元素的引用不能再使用；空容器上也不能再次调用 pop_back。
+}
+
+TEST_CASE("Vector pop_back destroys exactly one live element",
+          "[vector][pop_back][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> v;
+        v.reserve(5);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        v.emplace_back(13);
+
+        // CopyProbe 不可默认构造、不可赋值；删除不应复制或搬迁剩余元素。
+        CopyProbe::throw_on_copy = true;
+        REQUIRE_NOTHROW(v.pop_back());
+        CopyProbe::throw_on_copy = false;
+        REQUIRE(v.size() == 2);
+        CHECK(v.capacity() == 5);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(CopyProbe::live == 2);
+        CHECK(CopyProbe::destroyed == 1);
+        CHECK(CopyProbe::copies == 0);
+    }
+    // 容器析构只能销毁剩余两个对象，不能再次销毁已经弹出的尾元素。
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 3);
+}
+
+TEST_CASE("Vector pop_back releases unique ownership immediately",
+          "[vector][pop_back][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<std::unique_ptr<CopyProbe>> v;
+        v.reserve(4);
+        v.emplace_back(std::make_unique<CopyProbe>(7));
+        v.emplace_back(std::make_unique<CopyProbe>(11));
+        const auto* first_element = std::addressof(v[0]);
+        const auto* first_owned = v[0].get();
+        REQUIRE(CopyProbe::live == 2);
+
+        v.pop_back();
+        REQUIRE(v.size() == 1);
+        CHECK(v.capacity() == 4);
+        CHECK(std::addressof(v[0]) == first_element);
+        CHECK(v[0].get() == first_owned);
+        REQUIRE(v[0] != nullptr);
+        CHECK(v[0]->value == 7);
+        // 尾部 unique_ptr 的析构应立即释放所拥有的对象，不能只减少 size。
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 1);
+
+        v.pop_back();
+        CHECK(v.empty());
+        CHECK(v.size() == 0);
+        CHECK(v.capacity() == 4);
+        CHECK(CopyProbe::live == 0);
+        CHECK(CopyProbe::destroyed == 2);
+        CHECK(CopyProbe::copies == 0);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 2);
+}
+
+TEST_CASE("Vector pop_back to empty permits reuse of reserved storage",
+          "[vector][pop_back][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> v;
+        v.reserve(1);
+        const CopyProbe* slot = nullptr;
+        for (int value = 0; value < 4; ++value)
+        {
+            v.emplace_back(value);
+            REQUIRE(v.size() == 1);
+            CHECK(v.capacity() == 1);
+            CHECK(v[0].value == value);
+            CHECK(CopyProbe::live == 1);
+            if (value == 0)
+            {
+                slot = std::addressof(v[0]);
+            }
+            CHECK(std::addressof(v[0]) == slot);
+
+            // 1 -> 0 只结束对象生命周期；下一次追加在保留的槽位重新构造。
+            v.pop_back();
+            CHECK(v.empty());
+            CHECK(v.size() == 0);
+            CHECK(v.capacity() == 1);
+            CHECK(CopyProbe::live == 0);
+            CHECK(CopyProbe::destroyed == value + 1);
+            CHECK(CopyProbe::copies == 0);
+        }
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 4);
 }
