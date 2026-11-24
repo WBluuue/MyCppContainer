@@ -82,17 +82,26 @@ struct CopyProbe {
 };
 
 // 两个实例化分别模拟“不抛异常的移动”和“会抛异常但可以拷贝的移动”。
-// reserve 应选择安全的构造方式；赋值操作不可用，避免把赋值误当作构造。
+// reserve 和追加扩容应选择安全的搬迁方式；赋值操作不可用，避免把赋值误当作构造。
 template<bool NoThrowMove>
 struct RelocationProbe {
     inline static int live = 0;
     inline static int copies = 0;
     inline static int moves = 0;
     inline static int destroyed = 0;
+    // 直接构造新尾元素也可能失败，即使这个类型的移动构造是 noexcept。
+    inline static bool throw_on_value_construct = false;
 
     int value;
 
-    explicit RelocationProbe(int v) : value(v) { ++live; }
+    explicit RelocationProbe(int v) : value(v)
+    {
+        if (throw_on_value_construct)
+        {
+            throw std::runtime_error("RelocationProbe value construction failed");
+        }
+        ++live;
+    }
     RelocationProbe(const RelocationProbe& other) : value(other.value)
     {
         ++live;
@@ -121,6 +130,7 @@ struct RelocationProbe {
         copies = 0;
         moves = 0;
         destroyed = 0;
+        throw_on_value_construct = false;
     }
 };
 
@@ -155,7 +165,6 @@ static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().push_back(
 static_assert(!noexcept(std::declval<vector<int>&>().push_back(std::declval<int&&>())));
 
 // emplace_back 返回刚构造元素的引用；容量检查和构造都可能抛异常。
-// 新接口尚未实现时，这些表达式以及下方用例预期无法编译。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().emplace_back()), int&>);
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().emplace_back(7)), int&>);
 static_assert(!noexcept(std::declval<vector<int>&>().emplace_back(7)));
@@ -587,7 +596,7 @@ TEST_CASE("Vector push_back uses reserved capacity", "[vector][push_back]")
     CHECK(v.capacity() == 3);
     CHECK_FALSE(v.empty());
 
-    // 最后一个可用位置仍允许构造；本轮追加不会改变容量。
+    // 最后一个可用位置仍允许构造；有空余容量时追加不会改变容量。
     v.push_back(11);
     v.push_back(13);
     CHECK(v.size() == 3);
@@ -595,8 +604,8 @@ TEST_CASE("Vector push_back uses reserved capacity", "[vector][push_back]")
     CHECK_FALSE(v.empty());
 }
 
-TEST_CASE("Vector push_back rejects insufficient capacity before construction",
-          "[vector][push_back]")
+TEST_CASE("Vector growing lvalue push_back preserves state when tail copy throws",
+          "[vector][push_back][growth][exception]")
 {
     CopyProbe::reset();
     {
@@ -619,9 +628,9 @@ TEST_CASE("Vector push_back rejects insufficient capacity before construction",
             const auto old_copies = CopyProbe::copies;
             const auto old_live = CopyProbe::live;
 
-            // 容量不足必须先被拒绝，不能尝试拷贝，也不能自动扩容。
+            // 容量满时现在应尝试扩容；新尾元素拷贝失败，旧存储和状态仍须保留。
             CopyProbe::throw_on_copy = true;
-            REQUIRE_THROWS_AS(v.push_back(value), std::length_error);
+            REQUIRE_THROWS_AS(v.push_back(value), std::runtime_error);
             CopyProbe::throw_on_copy = false;
 
             CHECK(v.size() == old_size);
@@ -1446,8 +1455,8 @@ TEST_CASE("Vector rvalue push_back transfers unique ownership",
     CHECK(CopyProbe::destroyed == 3);
 }
 
-TEST_CASE("Vector rvalue push_back rejects full capacity before moving",
-          "[vector][push_back][rvalue][exception]")
+TEST_CASE("Vector growing rvalue push_back propagates tail move failure",
+          "[vector][push_back][rvalue][growth][exception]")
 {
     using Probe = RelocationProbe<false>;
     Probe::reset();
@@ -1470,12 +1479,12 @@ TEST_CASE("Vector rvalue push_back rejects full capacity before moving",
             const auto old_copies = Probe::copies;
             const auto old_live = Probe::live;
 
-            // Probe 的移动会抛 runtime_error；必须先检查容量，抛 length_error。
-            REQUIRE_THROWS_AS(v.push_back(std::move(value)), std::length_error);
+            // 新尾元素的移动构造失败；不能提交新容量，也不能搬迁旧元素。
+            REQUIRE_THROWS_AS(v.push_back(std::move(value)), std::runtime_error);
             CHECK(v.size() == old_size);
             CHECK(v.capacity() == old_capacity);
-            CHECK(value.value == 11);
-            CHECK(Probe::moves == 0);
+            // 不对外部移动源的值作通用回滚保证。
+            CHECK(Probe::moves == 1);
             CHECK(Probe::copies == old_copies);
             CHECK(Probe::live == old_live);
             CHECK(Probe::destroyed == 0);
@@ -1668,8 +1677,8 @@ TEST_CASE("Vector emplace_back forwards multiple arguments with unique ownership
     CHECK(CopyProbe::destroyed == 1);
 }
 
-TEST_CASE("Vector emplace_back rejects full capacity before constructing",
-          "[vector][emplace_back][exception]")
+TEST_CASE("Vector growing emplace_back preserves state when tail construction throws",
+          "[vector][emplace_back][growth][exception]")
 {
     using Probe = RelocationProbe<false>;
     Probe::reset();
@@ -1690,12 +1699,11 @@ TEST_CASE("Vector emplace_back rejects full capacity before constructing",
             const auto old_capacity = v.capacity();
             const auto old_live = Probe::live;
 
-            // 如果先尝试移动，Probe 会抛 runtime_error；应先拒绝容量不足。
-            REQUIRE_THROWS_AS(v.emplace_back(std::move(value)), std::length_error);
+            // 满容量时尝试构造新尾元素；失败后原容量、旧元素和生命周期不变。
+            REQUIRE_THROWS_AS(v.emplace_back(std::move(value)), std::runtime_error);
             CHECK(v.size() == old_size);
             CHECK(v.capacity() == old_capacity);
-            CHECK(value.value == 11);
-            CHECK(Probe::moves == 0);
+            CHECK(Probe::moves == 1);
             CHECK(Probe::copies == 0);
             CHECK(Probe::live == old_live);
             CHECK(Probe::destroyed == 0);
@@ -1747,4 +1755,262 @@ TEST_CASE("Vector failed emplace_back preserves state and permits retry",
     }
     CHECK(CopyProbe::live == 0);
     CHECK(CopyProbe::destroyed == 3);
+}
+
+TEST_CASE("Vector append interfaces grow capacity geometrically",
+          "[vector][growth]")
+{
+    int append_kind = 0;
+    SECTION("lvalue push_back") { append_kind = 0; }
+    SECTION("rvalue push_back") { append_kind = 1; }
+    SECTION("emplace_back") { append_kind = 2; }
+
+    vector<int> v;
+    for (std::size_t i = 0; i < 17; ++i)
+    {
+        const auto old_capacity = v.capacity();
+        auto expected_capacity = old_capacity;
+        if (v.size() == old_capacity)
+        {
+            // 本项目采用 0 -> 1、随后倍增的策略；这里的数值远离溢出边界。
+            expected_capacity = old_capacity == 0 ? 1 : old_capacity * 2;
+        }
+        int value = static_cast<int>(i * 3 + 1);
+        if (append_kind == 0)
+        {
+            const int& input = value;
+            v.push_back(input);
+        }
+        else if (append_kind == 1)
+        {
+            v.push_back(std::move(value));
+        }
+        else
+        {
+            auto& added = v.emplace_back(value);
+            REQUIRE(v.size() == i + 1);
+            CHECK(std::addressof(added) == std::addressof(v[i]));
+        }
+
+        REQUIRE(v.size() == i + 1);
+        CHECK(v.capacity() == expected_capacity);
+        CHECK_FALSE(v.empty());
+        for (std::size_t j = 0; j <= i; ++j)
+        {
+            CHECK(v[j] == static_cast<int>(j * 3 + 1));
+        }
+    }
+}
+
+TEST_CASE("Vector growth preserves aliased append arguments",
+          "[vector][growth][alias][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    int expected_copies = 0;
+    {
+        vector<Probe> v;
+        v.reserve(3);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        v.emplace_back(13);
+
+        SECTION("push_back copies an existing element")
+        {
+            expected_copies = 1;
+            v.push_back(v[0]);
+        }
+        SECTION("emplace_back copies an existing element")
+        {
+            expected_copies = 1;
+            auto& added = v.emplace_back(v[0]);
+            REQUIRE(v.size() == 4);
+            CHECK(std::addressof(added) == std::addressof(v[3]));
+        }
+        SECTION("emplace_back refers to an existing element member")
+        {
+            auto& added = v.emplace_back(v[0].value);
+            REQUIRE(v.size() == 4);
+            CHECK(std::addressof(added) == std::addressof(v[3]));
+        }
+
+        // 旧元素一旦被移动，value 就变成 -1；追加参数必须在它失效前被使用。
+        REQUIRE(v.size() == 4);
+        CHECK(v.capacity() == 6); // 手动 reserve 得到的非二次幂容量也要正确增长。
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(v[2].value == 13);
+        CHECK(v[3].value == 7);
+        CHECK(Probe::copies == expected_copies);
+        CHECK(Probe::moves == 3);
+        CHECK(Probe::live == 4);
+        CHECK(Probe::destroyed == 3);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 7);
+}
+
+TEST_CASE("Vector growing append transfers unique ownership and accepts rvalue aliases",
+          "[vector][growth][alias][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<std::unique_ptr<CopyProbe>> v;
+        auto owner = std::make_unique<CopyProbe>(7);
+        const auto* object = owner.get();
+        v.push_back(std::move(owner));
+        REQUIRE(v.size() == 1);
+        CHECK(v.capacity() == 1);
+        CHECK(owner == nullptr);
+
+        // 容量已满：把第一个元素的资源交给新尾元素，再搬迁已为空的旧元素。
+        v.push_back(std::move(v[0]));
+        REQUIRE(v.size() == 2);
+        CHECK(v.capacity() == 2);
+        CHECK(v[0] == nullptr);
+        REQUIRE(v[1] != nullptr);
+        CHECK(v[1].get() == object);
+        CHECK(v[1]->value == 7);
+        CHECK(CopyProbe::live == 1);
+        CHECK(CopyProbe::destroyed == 0);
+
+        v.emplace_back(std::make_unique<CopyProbe>(11));
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 4);
+        CHECK(v[0] == nullptr);
+        REQUIRE(v[1] != nullptr);
+        REQUIRE(v[2] != nullptr);
+        CHECK(v[1].get() == object);
+        CHECK(v[2]->value == 11);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 2);
+
+        v.clear();
+        CHECK(v.empty());
+        CHECK(v.capacity() == 4);
+        CHECK(CopyProbe::live == 0);
+        CHECK(CopyProbe::destroyed == 2);
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 2);
+}
+
+TEST_CASE("Vector growing append rolls back the tail and relocated prefix",
+          "[vector][growth][exception][lifetime]")
+{
+    int copied_prefix = 0;
+    SECTION("first old element copy throws") { copied_prefix = 0; }
+    SECTION("second old element copy throws") { copied_prefix = 1; }
+    SECTION("third old element copy throws") { copied_prefix = 2; }
+
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> v;
+        v.reserve(3);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        v.emplace_back(13);
+        const auto* first = std::addressof(v[0]);
+
+        // 新尾元素用 int 直接构造成功，随后旧元素的部分拷贝失败。
+        CopyProbe::copies_before_throw = copied_prefix;
+        REQUIRE_THROWS_AS(v.emplace_back(17), std::runtime_error);
+        CopyProbe::copies_before_throw = -1;
+
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 3);
+        CHECK(std::addressof(v[0]) == first);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(v[2].value == 13);
+        CHECK(CopyProbe::live == 3);
+        CHECK(CopyProbe::copies == copied_prefix);
+        // 回滚有两部分：已完成的旧元素拷贝，以及位置不连续的新尾元素。
+        CHECK(CopyProbe::destroyed == copied_prefix + 1);
+
+        auto& added = v.emplace_back(17);
+        REQUIRE(v.size() == 4);
+        CHECK(v.capacity() == 6);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(v[2].value == 13);
+        CHECK(v[3].value == 17);
+        CHECK(std::addressof(added) == std::addressof(v[3]));
+        CHECK(CopyProbe::live == 4);
+        CHECK(CopyProbe::copies == copied_prefix + 3);
+        CHECK(CopyProbe::destroyed == copied_prefix + 4);
+        // 成功扩容后，旧元素指针 first 已失效，不再使用。
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == copied_prefix + 8);
+}
+
+TEST_CASE("Vector growing append constructs the tail before moving old elements",
+          "[vector][growth][exception][lifetime]")
+{
+    using Probe = RelocationProbe<true>;
+    Probe::reset();
+    {
+        vector<Probe> v;
+        v.reserve(2);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        const auto* first = std::addressof(v[0]);
+
+        // 移动虽不抛异常，新尾元素的普通构造仍可能失败。
+        // 此时旧元素应尚未被移动，不能变成 moved-from 状态。
+        Probe::throw_on_value_construct = true;
+        REQUIRE_THROWS_AS(v.emplace_back(13), std::runtime_error);
+        Probe::throw_on_value_construct = false;
+
+        REQUIRE(v.size() == 2);
+        CHECK(v.capacity() == 2);
+        CHECK(std::addressof(v[0]) == first);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(Probe::moves == 0);
+        CHECK(Probe::copies == 0);
+        CHECK(Probe::live == 2);
+        CHECK(Probe::destroyed == 0);
+
+        REQUIRE_NOTHROW(v.emplace_back(13));
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 4);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(v[2].value == 13);
+        CHECK(Probe::moves == 2);
+        CHECK(Probe::copies == 0);
+        CHECK(Probe::live == 3);
+        CHECK(Probe::destroyed == 2);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
+}
+
+TEST_CASE("Vector growing append copies old elements when moving could throw",
+          "[vector][growth][lifetime]")
+{
+    using Probe = RelocationProbe<false>;
+    Probe::reset();
+    {
+        vector<Probe> v;
+        v.reserve(2);
+        v.emplace_back(7);
+        v.emplace_back(11);
+
+        // 新尾元素可直接构造；旧元素可拷贝且移动会抛异常，应选择拷贝搬迁。
+        REQUIRE_NOTHROW(v.emplace_back(13));
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 4);
+        CHECK(v[0].value == 7);
+        CHECK(v[1].value == 11);
+        CHECK(v[2].value == 13);
+        CHECK(Probe::copies == 2);
+        CHECK(Probe::moves == 0);
+        CHECK(Probe::live == 3);
+        CHECK(Probe::destroyed == 2);
+    }
+    CHECK(Probe::live == 0);
+    CHECK(Probe::destroyed == 5);
 }

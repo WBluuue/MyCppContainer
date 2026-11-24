@@ -91,21 +91,21 @@ public:
         //not enough -> allocate
         if(n>capacity_)
         {
-            T* ptr=Trait::allocate(alloc,n);
+            T* newData_=Trait::allocate(alloc,n);
 
             for(std::size_t i=0;i<size_;++i)
             {
                 try
                 {
-                    Trait::construct(alloc,ptr+i,std::move_if_noexcept(*(data_+i)));   
+                    Trait::construct(alloc,newData_+i,std::move_if_noexcept(*(data_+i)));   
                 }
                 catch(...)
                 {
                     for(std::size_t j=0;j<i;j++)
                     {
-                        Trait::destroy(alloc,ptr+j);
+                        Trait::destroy(alloc,newData_+j);
                     }
-                    Trait::deallocate(alloc,ptr,n);
+                    Trait::deallocate(alloc,newData_,n);
                     throw;   
                 }
             }
@@ -119,31 +119,81 @@ public:
                 Trait::deallocate(alloc,data_,capacity_);
             }
 
-            data_=ptr;
+            data_=newData_;
             capacity_=n;
         }
     }
 
     void push_back(const T& value)
     {
-        if(size_==capacity_)
-        {
-            throw std::length_error("Vector: push_back requires reserved capacity");
-        }
-
-        Trait::construct(alloc,data_+size_,value);
-        size_++;
+        this->emplace_back(value);
     }
 
     void push_back(T&& value)
     {
+        this->emplace_back(std::move(value));
+    }
+
+    template<typename... Args>
+    T& emplace_back(Args&&... args)
+    {
         if(size_==capacity_)
         {
-            throw std::length_error("Vector: push_back requires reserved capacity");
+            std::size_t limit=Trait::max_size(alloc);
+            if(capacity_==limit)
+            {
+                throw std::length_error("Vector: reserve exceeds max_size");
+            }
+
+            auto newCapacity_=(capacity_<=(limit>>1)?(capacity_==0?1:capacity_<<1):limit);
+
+            auto newData_=Trait::allocate(alloc,newCapacity_);
+            try
+            {
+                Trait::construct(alloc,newData_+size_,std::forward<Args>(args)...);
+            }
+            catch(...)
+            {
+                Trait::deallocate(alloc,newData_,newCapacity_);
+                throw;
+            }
+            
+            for(std::size_t i=0;i<size_;++i)
+            {
+                try
+                {
+                    Trait::construct(alloc,newData_+i,std::move_if_noexcept(*(data_+i)));   
+                }
+                catch(...)
+                {
+                    for(std::size_t j=0;j<i;++j)
+                    {
+                        Trait::destroy(alloc,newData_+j);
+                    }
+                    Trait::destroy(alloc,newData_+size_);
+                    Trait::deallocate(alloc,newData_,newCapacity_);
+                    throw;
+                }
+            }
+
+            for(std::size_t i=0;i<size_;++i)
+            {
+                Trait::destroy(alloc,data_+i);
+            }
+            if(data_!=nullptr)
+            {
+                Trait::deallocate(alloc,data_,capacity_);
+            }
+
+            data_=newData_;
+            capacity_=newCapacity_;
+            size_++;
+            return *(data_+size_-1);
         }
 
-        Trait::construct(alloc,data_+size_,std::move(value));
+        Trait::construct(alloc,data_+size_,std::forward<Args>(args)...);
         size_++;
+        return *(data_+size_-1);
     }
 
     T& operator[](std::size_t i) noexcept
@@ -163,19 +213,6 @@ public:
             Trait::destroy(alloc,data_+i);
         }
         size_=0;
-    }
-
-    template<typename... Args>
-    T& emplace_back(Args&&... args)
-    {
-        if(size_==capacity_)
-        {
-            throw std::length_error("Vector: emplace_back requires reserved capacity");
-        }
-
-        Trait::construct(alloc,data_+size_,std::forward<Args>(args)...);
-        size_++;
-        return *(data_+size_-1);
     }
 };
 
