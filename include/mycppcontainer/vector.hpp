@@ -234,6 +234,12 @@ public:
         return *(data_+size_-1);
     }
 
+    void pop_back() noexcept
+    {
+        size_--;
+        Trait::destroy(alloc,data_+size_);   
+    }
+
     T& operator[](std::size_t i) noexcept
     {
         return *(data_+i);
