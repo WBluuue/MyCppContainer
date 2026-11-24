@@ -111,11 +111,45 @@ public:
     }
 
 public:
-    auto size() const noexcept { return size_; }
+    std::size_t size() const noexcept { return size_; }
 
-    auto capacity() const noexcept { return capacity_; }
+    std::size_t capacity() const noexcept { return capacity_; }
+
+    T* data() noexcept { return data_; }
+
+    const T* data() const noexcept { return data_; }
 
     bool empty() const noexcept { return size_==0; }
+
+    T& operator[](std::size_t i) noexcept
+    {
+        return *(data_+i);
+    }
+
+    const T& operator[](std::size_t i) const noexcept
+    {
+        return *(data_+i);
+    }
+
+    T& front() noexcept
+    {
+        return *data_;
+    }
+
+    const T& front() const noexcept
+    {
+        return *data_;
+    }
+
+    T& back() noexcept
+    {
+        return *(data_+size_-1);
+    }
+
+    const T& back() const noexcept
+    {
+        return *(data_+size_-1);
+    }
 
 public:
     void reserve(std::size_t n)
@@ -238,16 +272,6 @@ public:
     {
         size_--;
         Trait::destroy(alloc,data_+size_);   
-    }
-
-    T& operator[](std::size_t i) noexcept
-    {
-        return *(data_+i);
-    }
-
-    const T& operator[](std::size_t i) const noexcept
-    {
-        return *(data_+i);
     }
 
     void clear() noexcept

@@ -3,6 +3,7 @@
 #include<cstddef>
 #include<limits>
 #include<memory>
+#include<span>
 #include<stdexcept>
 #include<type_traits>
 #include<utility>
@@ -184,12 +185,30 @@ static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>()[0]),
 static_assert(noexcept(std::declval<vector<int>&>()[0]));
 static_assert(noexcept(std::declval<const vector<int>&>()[0]));
 
+// 本轮只借用已有元素和存储：普通容器返回可写引用/指针，const 容器返回只读版本。
+// front/back 要求非空；decltype 和 noexcept 不执行访问。接口实现前预期无法编译。
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().front()), int&>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().front()),
+                             const int&>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().back()), int&>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().back()),
+                             const int&>);
+static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().data()), int*>);
+static_assert(std::is_same_v<decltype(std::declval<const vector<int>&>().data()),
+                             const int*>);
+static_assert(noexcept(std::declval<vector<int>&>().front()));
+static_assert(noexcept(std::declval<const vector<int>&>().front()));
+static_assert(noexcept(std::declval<vector<int>&>().back()));
+static_assert(noexcept(std::declval<const vector<int>&>().back()));
+static_assert(noexcept(std::declval<vector<int>&>().data()));
+static_assert(noexcept(std::declval<const vector<int>&>().data()));
+
 // clear 只结束元素生命周期，返回 void；沿用元素析构不抛异常的前提。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().clear()), void>);
 static_assert(noexcept(std::declval<vector<int>&>().clear()));
 
 // pop_back 的前置条件是非空，返回 void；沿用元素析构不抛异常的前提。
-// 这里只检查接口，不实际调用；接口实现前这些断言预期无法编译。
+// 这里只检查接口，不实际调用，不会违反非空前置条件。
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().pop_back()), void>);
 static_assert(noexcept(std::declval<vector<int>&>().pop_back()));
 
@@ -2697,4 +2716,202 @@ TEST_CASE("Vector pop_back to empty permits reuse of reserved storage",
     }
     CHECK(CopyProbe::live == 0);
     CHECK(CopyProbe::destroyed == 4);
+}
+
+TEST_CASE("Vector front and back refer to the first and last live elements",
+          "[vector][accessors]")
+{
+    vector<int> v;
+    v.reserve(5);
+    v.emplace_back(7);
+    SECTION("one element has the same front and back") {}
+    SECTION("multiple elements with spare capacity")
+    {
+        v.emplace_back(11);
+        v.emplace_back(13);
+    }
+    const auto size = v.size();
+    const auto& cv = v;
+
+    // back 由 size 决定；备用容量末端没有活对象。
+    CHECK(std::addressof(v.front()) == std::addressof(v[0]));
+    CHECK(std::addressof(cv.front()) == std::addressof(v[0]));
+    CHECK(std::addressof(v.back()) == std::addressof(v[size - 1]));
+    CHECK(std::addressof(cv.back()) == std::addressof(v[size - 1]));
+    CHECK(cv.front() == 7);
+    CHECK(cv.back() == v[size - 1]);
+    v.front() = 42;
+    CHECK(cv.front() == 42);
+    v.back() = 99;
+    CHECK(cv.back() == 99);
+    CHECK(v[size - 1] == 99);
+    CHECK(v[0] == (size == 1 ? 99 : 42));
+    REQUIRE(v.size() == size);
+    if (size > 1)
+    {
+        v.pop_back();
+        CHECK(v.back() == 11);
+        CHECK(cv.back() == 11);
+    }
+    CHECK(v.capacity() == 5);
+}
+
+TEST_CASE("Vector data exposes contiguous live elements through a borrowed span",
+          "[vector][accessors][data]")
+{
+    vector<int> v;
+    v.reserve(5);
+    v.emplace_back(7);
+    v.emplace_back(11);
+    v.emplace_back(13);
+    const auto& cv = v;
+    auto* first = v.data();
+    REQUIRE(first == std::addressof(v[0]));
+    CHECK(cv.data() == first);
+    for (std::size_t i = 0; i < v.size(); ++i)
+    {
+        CHECK(first + i == std::addressof(v[i]));
+        CHECK(first[i] == v[i]);
+    }
+
+    // span 借用已有对象，长度必须是 size；不能把未构造的备用容量暴露为活元素。
+    std::span<int> writable(v.data(), v.size());
+    std::span<const int> readable(cv.data(), cv.size());
+    REQUIRE(writable.size() == 3);
+    REQUIRE(readable.size() == 3);
+    writable[1] = 42;
+    CHECK(v[1] == 42);
+    CHECK(readable[1] == 42);
+    CHECK(writable.data() == first);
+    CHECK(readable.data() == first);
+    CHECK(v.size() == 3);
+    CHECK(v.capacity() == 5);
+}
+
+TEST_CASE("Vector data reflects retained storage even when no elements are live",
+          "[vector][accessors][data]")
+{
+    vector<int> v;
+    const auto& cv = v;
+    // 本项目约定 data 直接暴露底层指针；默认状态没有分配，因此返回 nullptr。
+    CHECK(v.data() == nullptr);
+    CHECK(cv.data() == nullptr);
+    v.reserve(4);
+    auto* storage = v.data();
+    REQUIRE(storage != nullptr);
+    CHECK(cv.data() == storage);
+    CHECK(v.empty());
+
+    v.emplace_back(7);
+    v.emplace_back(11);
+    CHECK(v.data() == storage);
+    v.clear();
+    CHECK(v.empty());
+    CHECK(v.data() == storage);
+    CHECK(cv.data() == storage);
+    CHECK(v.capacity() == 4);
+    // 此时只能观察指针，不解引用；空容器也不调用 front/back。
+    v.emplace_back(17);
+    CHECK(v.data() == storage);
+    CHECK(v.front() == 17);
+    CHECK(v.back() == 17);
+    v.pop_back();
+    CHECK(v.empty());
+    CHECK(v.data() == storage);
+    CHECK(cv.data() == storage);
+    CHECK(v.capacity() == 4);
+}
+
+TEST_CASE("Vector data follows storage ownership across moves",
+          "[vector][accessors][data][move]")
+{
+    vector<int> source;
+    source.reserve(4);
+    source.emplace_back(7);
+    source.emplace_back(11);
+    const auto* storage = source.data();
+    const auto& const_source = source;
+    vector<int> destination(std::move(source));
+    CHECK(source.data() == nullptr);
+    CHECK(const_source.data() == nullptr);
+    CHECK(source.size() == 0);
+    CHECK(source.capacity() == 0);
+    REQUIRE(destination.size() == 2);
+    CHECK(destination.data() == storage);
+    CHECK(destination.front() == 7);
+    CHECK(destination.back() == 11);
+
+    vector<int> target;
+    target.reserve(8);
+    target.emplace_back(99);
+    target = std::move(destination);
+    CHECK(destination.data() == nullptr);
+    CHECK(destination.size() == 0);
+    CHECK(destination.capacity() == 0);
+    REQUIRE(target.size() == 2);
+    CHECK(target.data() == storage);
+    CHECK(target.front() == 7);
+    CHECK(target.back() == 11);
+    // 指针只是借用；所有权随移动转给 target，source 重新追加要取得独立存储。
+    source.emplace_back(17);
+    CHECK(source.data() != target.data());
+    CHECK(source.front() == 17);
+    CHECK(target.front() == 7);
+}
+
+TEST_CASE("Vector accessors do not create or destroy element objects",
+          "[vector][accessors][lifetime]")
+{
+    CopyProbe::reset();
+    {
+        vector<CopyProbe> v;
+        v.reserve(5);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        const auto& cv = v;
+        // CopyProbe 不可默认构造、不可赋值；所有访问接口都只借用现有元素。
+        CopyProbe::throw_on_copy = true;
+        CHECK(std::addressof(v.front()) == std::addressof(v[0]));
+        CHECK(std::addressof(cv.front()) == std::addressof(v[0]));
+        CHECK(std::addressof(v.back()) == std::addressof(v[1]));
+        CHECK(std::addressof(cv.back()) == std::addressof(v[1]));
+        CHECK(v.data() == std::addressof(v[0]));
+        CHECK(cv.data() == std::addressof(v[0]));
+        CHECK(cv.front().value == 7);
+        CHECK(cv.back().value == 11);
+        CHECK(CopyProbe::copies == 0);
+        CHECK(CopyProbe::live == 2);
+        CHECK(CopyProbe::destroyed == 0);
+        CopyProbe::throw_on_copy = false;
+    }
+    CHECK(CopyProbe::live == 0);
+    CHECK(CopyProbe::destroyed == 2);
+}
+
+TEST_CASE("Vector accessors preserve move-only element ownership",
+          "[vector][accessors][lifetime]")
+{
+    vector<std::unique_ptr<int>> v;
+    v.reserve(4);
+    v.emplace_back(std::make_unique<int>(7));
+    v.emplace_back(std::make_unique<int>(11));
+    const auto& cv = v;
+    const auto* first_owned = v[0].get();
+    const auto* last_owned = v[1].get();
+
+    // data 指向 unique_ptr 元素，不是它们所拥有的 int；访问不会转移任何所有权。
+    CHECK(std::addressof(v.front()) == std::addressof(v[0]));
+    CHECK(std::addressof(cv.front()) == std::addressof(v[0]));
+    CHECK(std::addressof(v.back()) == std::addressof(v[1]));
+    CHECK(std::addressof(cv.back()) == std::addressof(v[1]));
+    REQUIRE(v.data() == std::addressof(v[0]));
+    REQUIRE(cv.data() == std::addressof(v[0]));
+    CHECK(v.front().get() == first_owned);
+    CHECK(cv.front().get() == first_owned);
+    CHECK(v.back().get() == last_owned);
+    CHECK(cv.back().get() == last_owned);
+    CHECK(v.data()[0].get() == first_owned);
+    CHECK(cv.data()[1].get() == last_owned);
+    CHECK(v.size() == 2);
+    CHECK(v.capacity() == 4);
 }
