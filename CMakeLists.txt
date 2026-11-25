@@ -18,3 +18,9 @@ if(BUILD_TESTING)
     find_package(Catch2 3 REQUIRED)
     add_subdirectory(tests)
 endif()
+
+option(
+    MYCPPCONTAINER_ENABLE_SANITIZERS
+    "Enable ASan and UBSan for tests"
+    OFF
+)

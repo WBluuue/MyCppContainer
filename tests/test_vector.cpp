@@ -2,6 +2,7 @@
 #include<mycppcontainer/vector.hpp>
 #include<algorithm>
 #include<cstddef>
+#include<cstdint>
 #include<iterator>
 #include<limits>
 #include<memory>
@@ -157,11 +158,59 @@ struct ConstCopyProbe {
     ConstCopyProbe& operator=(const ConstCopyProbe&) = delete;
 };
 
+// 没有拷贝退路，且移动可在修改源后抛异常；用于验证弱于强回滚的清理保证。
+struct ThrowingMoveOnly {
+    inline static int live = 0;
+    inline static int move_attempts = 0;
+    inline static int destroyed = 0;
+    inline static int moves_before_throw = -1;
+
+    int value;
+    explicit ThrowingMoveOnly(int v) : value(v) { ++live; }
+    ThrowingMoveOnly(const ThrowingMoveOnly&) = delete;
+    ThrowingMoveOnly& operator=(const ThrowingMoveOnly&) = delete;
+    ThrowingMoveOnly& operator=(ThrowingMoveOnly&&) = delete;
+    ThrowingMoveOnly(ThrowingMoveOnly&& other) : value(other.value)
+    {
+        other.value = -1;
+        ++move_attempts;
+        if (moves_before_throw == 0)
+        {
+            // 失败对象未完成构造，不计入 live；它本身也不会执行析构函数。
+            throw std::runtime_error("ThrowingMoveOnly move failed");
+        }
+        if (moves_before_throw > 0) { --moves_before_throw; }
+        ++live;
+    }
+    ~ThrowingMoveOnly()
+    {
+        --live;
+        ++destroyed;
+    }
+    static void reset() noexcept
+    {
+        live = 0;
+        move_attempts = 0;
+        destroyed = 0;
+        moves_before_throw = -1;
+    }
+};
+
+// 对齐超过普通 int；不能只按字节数足够就认为分配正确。
+struct alignas(64) OverAlignedValue {
+    int value;
+    explicit OverAlignedValue(int v) : value(v) {}
+};
+
 } // namespace
 
 static_assert(!std::is_default_constructible_v<NoDefault>);
 static_assert(!std::is_default_constructible_v<CopyProbe>);
 static_assert(!std::is_copy_assignable_v<CopyProbe>);
+static_assert(!std::is_copy_constructible_v<ThrowingMoveOnly>);
+static_assert(std::is_move_constructible_v<ThrowingMoveOnly>);
+static_assert(!std::is_nothrow_move_constructible_v<ThrowingMoveOnly>);
+static_assert(alignof(OverAlignedValue) == 64);
 
 // 拷贝构造和拷贝赋值均依据 T 的拷贝构造能力约束接口。
 // 元素不可赋值不妨碍容器通过独立副本替换旧内容。
@@ -206,7 +255,7 @@ static_assert(noexcept(std::declval<const vector<int>&>().back()));
 static_assert(noexcept(std::declval<vector<int>&>().data()));
 static_assert(noexcept(std::declval<const vector<int>&>().data()));
 
-// 本轮直接把指针作为迭代器，不需要自定义迭代器类；缺少接口时预期无法编译。
+// 基础迭代直接使用指针，不需要自定义迭代器类。
 static_assert(std::is_same_v<vector<int>::iterator, int*>);
 static_assert(std::is_same_v<vector<int>::const_iterator, const int*>);
 static_assert(std::is_same_v<decltype(std::declval<vector<int>&>().begin()), int*>);
@@ -3155,4 +3204,130 @@ TEST_CASE("Vector iterator endpoints follow size changes and ownership transfer"
     CHECK(destination.end() == first + 1);
     REQUIRE(destination.size() == 1);
     CHECK(*destination.begin() == 13);
+}
+
+TEST_CASE("Vector reserve cleans up after a throwing move-only relocation",
+          "[vector][memory][exception]")
+{
+    int completed_moves = 0;
+    SECTION("first move throws") { completed_moves = 0; }
+    SECTION("middle move throws") { completed_moves = 1; }
+    SECTION("last move throws") { completed_moves = 2; }
+    ThrowingMoveOnly::reset();
+    {
+        vector<ThrowingMoveOnly> v;
+        v.reserve(3);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        v.emplace_back(13);
+        const auto* storage = v.data();
+
+        ThrowingMoveOnly::moves_before_throw = completed_moves;
+        REQUIRE_THROWS_AS(v.reserve(6), std::runtime_error);
+        ThrowingMoveOnly::moves_before_throw = -1;
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 3);
+        CHECK(v.data() == storage);
+        CHECK(ThrowingMoveOnly::live == 3);
+        CHECK(ThrowingMoveOnly::move_attempts == completed_moves + 1);
+        CHECK(ThrowingMoveOnly::destroyed == completed_moves);
+
+        // 源值可能已被移动修改，不要求恢复；旧对象仍须可析构，容器仍须可清空复用。
+        v.clear();
+        CHECK(v.empty());
+        CHECK(v.capacity() == 3);
+        CHECK(ThrowingMoveOnly::live == 0);
+        CHECK(ThrowingMoveOnly::destroyed == completed_moves + 3);
+        v.emplace_back(17);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0].value == 17);
+    }
+    CHECK(ThrowingMoveOnly::live == 0);
+    CHECK(ThrowingMoveOnly::destroyed == completed_moves + 4);
+    // 对象计数不能证明新存储已释放；泄漏检测负责补充这部分证据。
+}
+
+TEST_CASE("Vector growth cleans up tail and prefix after a throwing move-only relocation",
+          "[vector][memory][exception]")
+{
+    int completed_moves = 0;
+    SECTION("first move throws") { completed_moves = 0; }
+    SECTION("middle move throws") { completed_moves = 1; }
+    SECTION("last move throws") { completed_moves = 2; }
+    ThrowingMoveOnly::reset();
+    {
+        vector<ThrowingMoveOnly> v;
+        v.reserve(3);
+        v.emplace_back(7);
+        v.emplace_back(11);
+        v.emplace_back(13);
+        const auto* storage = v.data();
+
+        ThrowingMoveOnly::moves_before_throw = completed_moves;
+        REQUIRE_THROWS_AS(v.emplace_back(99), std::runtime_error);
+        ThrowingMoveOnly::moves_before_throw = -1;
+        REQUIRE(v.size() == 3);
+        CHECK(v.capacity() == 3);
+        CHECK(v.data() == storage);
+        CHECK(ThrowingMoveOnly::live == 3);
+        CHECK(ThrowingMoveOnly::move_attempts == completed_moves + 1);
+        // 新尾元素已先构造成功；搬迁失败时必须连同已完成的前缀一起销毁。
+        CHECK(ThrowingMoveOnly::destroyed == completed_moves + 1);
+
+        v.clear();
+        CHECK(v.empty());
+        CHECK(v.capacity() == 3);
+        CHECK(ThrowingMoveOnly::live == 0);
+        CHECK(ThrowingMoveOnly::destroyed == completed_moves + 4);
+        v.emplace_back(17);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0].value == 17);
+    }
+    CHECK(ThrowingMoveOnly::live == 0);
+    CHECK(ThrowingMoveOnly::destroyed == completed_moves + 5);
+}
+
+TEST_CASE("Vector storage preserves over-alignment across allocation paths",
+          "[vector][memory][alignment]")
+{
+    const auto check_alignment = [](const vector<OverAlignedValue>& v) {
+        REQUIRE_FALSE(v.empty());
+        REQUIRE(v.data() != nullptr);
+        CHECK(reinterpret_cast<std::uintptr_t>(v.data()) % alignof(OverAlignedValue) == 0);
+        for (std::size_t i = 0; i < v.size(); ++i)
+        {
+            CHECK(reinterpret_cast<std::uintptr_t>(std::addressof(v[i])) %
+                  alignof(OverAlignedValue) == 0);
+        }
+    };
+    vector<OverAlignedValue> v;
+    v.reserve(2);
+    v.emplace_back(7);
+    v.emplace_back(11);
+    check_alignment(v);
+
+    // 自动扩容、显式 reserve 和复制都会重新分配，必须维持 T 的对齐要求。
+    v.emplace_back(13);
+    check_alignment(v);
+    v.reserve(9);
+    check_alignment(v);
+    REQUIRE(v.size() == 3);
+    CHECK(v[0].value == 7);
+    CHECK(v[1].value == 11);
+    CHECK(v[2].value == 13);
+
+    vector<OverAlignedValue> copied(v);
+    check_alignment(copied);
+    REQUIRE(copied.size() == 3);
+    CHECK(copied[0].value == 7);
+    CHECK(copied[1].value == 11);
+    CHECK(copied[2].value == 13);
+    vector<OverAlignedValue> assigned;
+    assigned.emplace_back(99);
+    assigned = v;
+    check_alignment(assigned);
+    REQUIRE(assigned.size() == 3);
+    CHECK(assigned[0].value == 7);
+    CHECK(assigned[1].value == 11);
+    CHECK(assigned[2].value == 13);
 }

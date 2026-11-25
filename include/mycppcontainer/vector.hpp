@@ -20,7 +20,7 @@ private:
     using Alloc=std::allocator<T>;
     using Trait=std::allocator_traits<Alloc>;
 
-    Alloc alloc;
+    [[no_unique_address]] Alloc alloc;
 
 public:
     Vector()=default;

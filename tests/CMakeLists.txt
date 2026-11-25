@@ -11,3 +11,14 @@ target_link_libraries(container_lab_tests
 
 include(Catch)
 catch_discover_tests(container_lab_tests)
+
+if(MYCPPCONTAINER_ENABLE_SANITIZERS)
+    target_compile_options(container_lab_tests PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+
+    target_link_options(container_lab_tests PRIVATE
+        -fsanitize=address,undefined
+    )
+endif()
