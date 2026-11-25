@@ -26,11 +26,25 @@ public:
 
     UniquePtr(const UniquePtr&)=delete;
 
-    UniquePtr(UniquePtr&& other)=delete;
+    UniquePtr(UniquePtr&& other) noexcept
+    {
+        data_=other.data_;
+        other.data_=nullptr;   
+    }
 
     UniquePtr& operator=(const UniquePtr&)=delete;
 
-    UniquePtr& operator=(UniquePtr&& rhs)=delete;
+    UniquePtr& operator=(UniquePtr&& rhs) noexcept
+    {
+        if(this!=(&rhs))
+        {
+            delete data_;
+
+            data_=rhs.data_;
+            rhs.data_=nullptr;
+        }
+        return *this;   
+    }
 
 public:
     T* get() const noexcept { return data_; }
