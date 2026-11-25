@@ -54,6 +54,28 @@ public:
     T* operator->() const noexcept { return data_; };
 
     explicit operator bool() const noexcept { return data_!=nullptr; }
+
+public:
+    T* release() noexcept
+    {
+        auto ptr=data_;
+        data_=nullptr;
+        return ptr;
+    }
+
+    void reset(T* ptr=nullptr) noexcept
+    {
+        auto optr=data_;
+        data_=ptr;
+        delete optr;
+    }
+
+    void swap(UniquePtr& other) noexcept
+    {
+        auto optr=other.data_;
+        other.data_=data_;
+        data_=optr;
+    }
 };
 
 }
