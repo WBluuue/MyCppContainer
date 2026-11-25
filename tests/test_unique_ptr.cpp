@@ -42,6 +42,28 @@ using IntOwner = mycppcontainer::UniquePtr<int>;
 using ObjectOwner = mycppcontainer::UniquePtr<TrackedObject>;
 using ConstIntOwner = mycppcontainer::UniquePtr<const int>;
 
+struct ResetObservation {
+    bool destructor_called = false;
+    bool saw_expected_pointer = false;
+};
+
+// 旧对象的析构可以观察 owner.get()；reset 应先公布新指针，再删除旧对象。
+// 这里只读取所有者，不在析构中重入 reset 或修改它。
+struct ResetObserver {
+    mycppcontainer::UniquePtr<ResetObserver>* owner = nullptr;
+    ResetObserver* expected = nullptr;
+    ResetObservation* observation = nullptr;
+
+    ~ResetObserver() noexcept
+    {
+        if (observation != nullptr)
+        {
+            observation->destructor_called = true;
+            observation->saw_expected_pointer = (owner->get() == expected);
+        }
+    }
+};
+
 // 已通过的基础接口仍是回归要求；新增移动能力不能恢复任何拷贝通道。
 static_assert(std::is_nothrow_default_constructible_v<IntOwner>);
 static_assert(std::is_nothrow_constructible_v<IntOwner, int*>);
@@ -71,8 +93,7 @@ static_assert(!std::is_convertible_v<const IntOwner&, int>);
 static_assert(std::is_same_v<decltype(std::declval<const IntOwner&>().operator bool()), bool>);
 static_assert(noexcept(static_cast<bool>(std::declval<const IntOwner&>())));
 
-// 本轮要求同类型所有权移动；被管理的 T 本身可以完全不可移动。
-// 当前移动成员仍被删除，新断言/用例在实现之前预期无法编译。
+// 同类型所有权移动已验收；被管理的 T 本身可以完全不可移动。
 static_assert(std::is_nothrow_move_constructible_v<IntOwner>);
 static_assert(std::is_nothrow_move_assignable_v<IntOwner>);
 static_assert(std::is_nothrow_move_constructible_v<ObjectOwner>);
@@ -84,6 +105,22 @@ static_assert(std::is_same_v<decltype(std::declval<ObjectOwner&>() =
 // std::move 不会去掉 const；不能从一个无法清空的 const 所有者偷取资源。
 static_assert(!std::is_constructible_v<IntOwner, const IntOwner&&>);
 static_assert(!std::is_assignable_v<IntOwner&, const IntOwner&&>);
+
+// 本轮新增三个资源管理接口；实现之前缺少成员导致编译失败是预期状态。
+static_assert(std::is_same_v<decltype(std::declval<IntOwner&>().release()), int*>);
+static_assert(std::is_same_v<decltype(std::declval<ConstIntOwner&>().release()), const int*>);
+static_assert(noexcept(std::declval<IntOwner&>().release()));
+static_assert(std::is_same_v<decltype(std::declval<IntOwner&>().reset()), void>);
+static_assert(std::is_same_v<decltype(std::declval<IntOwner&>().reset(nullptr)), void>);
+static_assert(std::is_same_v<decltype(std::declval<IntOwner&>().reset(
+                                    std::declval<int*>())), void>);
+static_assert(std::is_same_v<decltype(std::declval<ConstIntOwner&>().reset(
+                                    std::declval<const int*>())), void>);
+static_assert(noexcept(std::declval<IntOwner&>().reset()));
+static_assert(noexcept(std::declval<IntOwner&>().reset(std::declval<int*>())));
+static_assert(std::is_same_v<decltype(std::declval<ObjectOwner&>().swap(
+                                    std::declval<ObjectOwner&>())), void>);
+static_assert(noexcept(std::declval<ObjectOwner&>().swap(std::declval<ObjectOwner&>())));
 
 } // namespace
 
@@ -426,4 +463,213 @@ TEST_CASE("UniquePtr transferred ownership is released once during unwinding",
     // 空源随后析构不能再次删除已经由目标释放的对象。
     CHECK(counts.live == 0);
     CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr release from empty is harmless and repeatable",
+          "[unique_ptr][release]")
+{
+    ObjectOwner owner;
+    CHECK(owner.release() == nullptr);
+    CHECK(owner.get() == nullptr);
+    CHECK_FALSE(static_cast<bool>(owner));
+    CHECK(owner.release() == nullptr);
+}
+
+TEST_CASE("UniquePtr release transfers deletion responsibility without destroying the object",
+          "[unique_ptr][release][lifetime]")
+{
+    LifetimeCounts counts;
+    // 标准库所有者仅用于测试清理，确保断言失败时也能回收已交出的资源。
+    std::unique_ptr<TrackedObject> released;
+    {
+        ObjectOwner owner(new TrackedObject(counts, 7));
+        auto* object = owner.get();
+        released.reset(owner.release());
+
+        REQUIRE(released.get() == object);
+        CHECK(owner.get() == nullptr);
+        CHECK_FALSE(static_cast<bool>(owner));
+        CHECK(owner.release() == nullptr);
+        REQUIRE(counts.live == 1);
+        CHECK(released->value == 7);
+        CHECK(counts.constructed == 1);
+        CHECK(counts.destroyed == 0);
+    }
+    // 原所有者已经析构，被交出的 T 仍存活；最终由接收者负责删除。
+    REQUIRE(counts.live == 1);
+    CHECK(counts.destroyed == 0);
+    CHECK(released->value == 7);
+    released.reset();
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr reset clears ownership and repeated empty reset is harmless",
+          "[unique_ptr][reset][lifetime]")
+{
+    bool owns = false;
+    SECTION("initially empty") {}
+    SECTION("initially owning") { owns = true; }
+
+    LifetimeCounts counts;
+    {
+        ObjectOwner owner(owns ? new TrackedObject(counts, 7) : nullptr);
+        owner.reset();
+        CHECK(owner.get() == nullptr);
+        CHECK_FALSE(static_cast<bool>(owner));
+        CHECK(counts.constructed == (owns ? 1 : 0));
+        CHECK(counts.live == 0);
+        CHECK(counts.destroyed == (owns ? 1 : 0));
+
+        owner.reset(nullptr);
+        owner.reset();
+        CHECK(owner.get() == nullptr);
+        CHECK(counts.destroyed == (owns ? 1 : 0));
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr reset adopts a new object and releases only the old object",
+          "[unique_ptr][reset][lifetime]")
+{
+    bool had_old_object = false;
+    SECTION("adopt into empty owner") {}
+    SECTION("replace existing object") { had_old_object = true; }
+
+    LifetimeCounts old_counts;
+    LifetimeCounts new_counts;
+    {
+        ObjectOwner owner(had_old_object ? new TrackedObject(old_counts, 7) : nullptr);
+        auto* replacement = new TrackedObject(new_counts, 11);
+        owner.reset(replacement);
+
+        REQUIRE(owner.get() == replacement);
+        CHECK(static_cast<bool>(owner));
+        CHECK(old_counts.constructed == (had_old_object ? 1 : 0));
+        CHECK(old_counts.live == 0);
+        CHECK(old_counts.destroyed == (had_old_object ? 1 : 0));
+        CHECK(new_counts.constructed == 1);
+        REQUIRE(new_counts.live == 1);
+        CHECK(new_counts.destroyed == 0);
+        CHECK(owner->value == 11);
+        // TrackedObject 不可赋值/移动；reset 只能换所有权，不能改写旧 T 的值。
+    }
+    CHECK(old_counts.live == 0);
+    CHECK(old_counts.destroyed == (had_old_object ? 1 : 0));
+    CHECK(new_counts.live == 0);
+    CHECK(new_counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr reset publishes the new pointer before destroying the old object",
+          "[unique_ptr][reset][lifetime]")
+{
+    bool replace_with_object = false;
+    SECTION("clear to null") {}
+    SECTION("replace with another object") { replace_with_object = true; }
+
+    ResetObservation observation;
+    mycppcontainer::UniquePtr<ResetObserver> owner(new ResetObserver);
+    auto* replacement = replace_with_object ? new ResetObserver : nullptr;
+    owner->owner = std::addressof(owner);
+    owner->expected = replacement;
+    owner->observation = std::addressof(observation);
+
+    owner.reset(replacement);
+    CHECK(observation.destructor_called);
+    CHECK(observation.saw_expected_pointer);
+    CHECK(owner.get() == replacement);
+    // replacement 没有观察回调；正常作用域析构只清理该新对象。
+}
+
+TEST_CASE("UniquePtr reset can readopt its released pointer without destruction",
+          "[unique_ptr][release][reset][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        ObjectOwner owner(new TrackedObject(counts, 7));
+        auto* object = owner.get();
+        // 实参求值时 release 已清空所有者，reset 接管的是无人管理的指针。
+        // 这不同于非空 owner.reset(owner.get())；后者违反本轮使用前提，不测试。
+        owner.reset(owner.release());
+        REQUIRE(owner.get() == object);
+        REQUIRE(counts.live == 1);
+        CHECK(owner->value == 7);
+        CHECK(counts.constructed == 1);
+        CHECK(counts.destroyed == 0);
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr member swap exchanges ownership without changing object lifetimes",
+          "[unique_ptr][swap][lifetime]")
+{
+    bool first_owns = false;
+    bool second_owns = false;
+    SECTION("both empty") {}
+    SECTION("only first owns") { first_owns = true; }
+    SECTION("only second owns") { second_owns = true; }
+    SECTION("both own")
+    {
+        first_owns = true;
+        second_owns = true;
+    }
+
+    LifetimeCounts first_counts;
+    LifetimeCounts second_counts;
+    {
+        ObjectOwner first(first_owns ? new TrackedObject(first_counts, 7) : nullptr);
+        ObjectOwner second(second_owns ? new TrackedObject(second_counts, 11) : nullptr);
+        auto* first_object = first.get();
+        auto* second_object = second.get();
+
+        first.swap(second);
+        REQUIRE(first.get() == second_object);
+        REQUIRE(second.get() == first_object);
+        CHECK(static_cast<bool>(first) == second_owns);
+        CHECK(static_cast<bool>(second) == first_owns);
+        REQUIRE(first_counts.live == (first_owns ? 1 : 0));
+        REQUIRE(second_counts.live == (second_owns ? 1 : 0));
+        CHECK(first_counts.destroyed == 0);
+        CHECK(second_counts.destroyed == 0);
+        if (second_owns) { CHECK(first->value == 11); }
+        if (first_owns) { CHECK(second->value == 7); }
+
+        // 交换回来仍不应构造或销毁 T，也不应该使对象地址改变。
+        first.swap(second);
+        CHECK(first.get() == first_object);
+        CHECK(second.get() == second_object);
+        CHECK(first_counts.constructed == (first_owns ? 1 : 0));
+        CHECK(second_counts.constructed == (second_owns ? 1 : 0));
+        CHECK(first_counts.destroyed == 0);
+        CHECK(second_counts.destroyed == 0);
+    }
+    CHECK(first_counts.live == 0);
+    CHECK(second_counts.live == 0);
+    CHECK(first_counts.destroyed == (first_owns ? 1 : 0));
+    CHECK(second_counts.destroyed == (second_owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr self swap preserves empty and owning states",
+          "[unique_ptr][swap][lifetime]")
+{
+    bool owns = false;
+    SECTION("empty owner") {}
+    SECTION("owning object") { owns = true; }
+
+    LifetimeCounts counts;
+    {
+        ObjectOwner owner(owns ? new TrackedObject(counts, 7) : nullptr);
+        auto* object = owner.get();
+        owner.swap(owner);
+        REQUIRE(owner.get() == object);
+        CHECK(static_cast<bool>(owner) == owns);
+        CHECK(counts.constructed == (owns ? 1 : 0));
+        REQUIRE(counts.live == (owns ? 1 : 0));
+        CHECK(counts.destroyed == 0);
+        if (owns) { CHECK(owner->value == 7); }
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
 }
