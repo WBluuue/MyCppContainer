@@ -42,8 +42,7 @@ using IntOwner = mycppcontainer::UniquePtr<int>;
 using ObjectOwner = mycppcontainer::UniquePtr<TrackedObject>;
 using ConstIntOwner = mycppcontainer::UniquePtr<const int>;
 
-// 这些断言检查接口契约；当前只有头文件骨架，尚未实现时预期无法编译。
-// 不检查 UniquePtr 的移动能力，避免提前要求后续任务的接口。
+// 已通过的基础接口仍是回归要求；新增移动能力不能恢复任何拷贝通道。
 static_assert(std::is_nothrow_default_constructible_v<IntOwner>);
 static_assert(std::is_nothrow_constructible_v<IntOwner, int*>);
 static_assert(std::is_nothrow_destructible_v<IntOwner>);
@@ -71,6 +70,20 @@ static_assert(!std::is_convertible_v<IntOwner&, bool>);
 static_assert(!std::is_convertible_v<const IntOwner&, int>);
 static_assert(std::is_same_v<decltype(std::declval<const IntOwner&>().operator bool()), bool>);
 static_assert(noexcept(static_cast<bool>(std::declval<const IntOwner&>())));
+
+// 本轮要求同类型所有权移动；被管理的 T 本身可以完全不可移动。
+// 当前移动成员仍被删除，新断言/用例在实现之前预期无法编译。
+static_assert(std::is_nothrow_move_constructible_v<IntOwner>);
+static_assert(std::is_nothrow_move_assignable_v<IntOwner>);
+static_assert(std::is_nothrow_move_constructible_v<ObjectOwner>);
+static_assert(std::is_nothrow_move_assignable_v<ObjectOwner>);
+static_assert(std::is_nothrow_move_constructible_v<ConstIntOwner>);
+static_assert(std::is_nothrow_move_assignable_v<ConstIntOwner>);
+static_assert(std::is_same_v<decltype(std::declval<ObjectOwner&>() =
+                                    std::declval<ObjectOwner&&>()), ObjectOwner&>);
+// std::move 不会去掉 const；不能从一个无法清空的 const 所有者偷取资源。
+static_assert(!std::is_constructible_v<IntOwner, const IntOwner&&>);
+static_assert(!std::is_assignable_v<IntOwner&, const IntOwner&&>);
 
 } // namespace
 
@@ -204,6 +217,213 @@ TEST_CASE("UniquePtr destroys its object during stack unwinding",
     };
     REQUIRE_THROWS_AS(leave_with_exception(), std::runtime_error);
     CHECK(counts.constructed == 1);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr move construction from empty leaves both owners empty",
+          "[unique_ptr][move]")
+{
+    ObjectOwner source;
+    ObjectOwner destination(std::move(source));
+    CHECK(source.get() == nullptr);
+    CHECK(destination.get() == nullptr);
+    CHECK_FALSE(static_cast<bool>(source));
+    CHECK_FALSE(static_cast<bool>(destination));
+}
+
+TEST_CASE("UniquePtr move construction transfers ownership without moving the object",
+          "[unique_ptr][move][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        ObjectOwner source(new TrackedObject(counts, 7));
+        auto* object = source.get();
+        {
+            ObjectOwner destination(std::move(source));
+            CHECK(source.get() == nullptr);
+            CHECK_FALSE(static_cast<bool>(source));
+            REQUIRE(destination.get() == object);
+            REQUIRE(counts.live == 1);
+            CHECK(destination->value == 7);
+            CHECK(static_cast<bool>(destination));
+            CHECK(counts.constructed == 1);
+            CHECK(counts.destroyed == 0);
+        }
+        // 目标先析构并删除对象；源仍存活，但不再拥有任何资源。
+        CHECK(source.get() == nullptr);
+        CHECK(counts.live == 0);
+        CHECK(counts.destroyed == 1);
+    }
+    CHECK(counts.constructed == 1);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr move-constructed destination outlives its source",
+          "[unique_ptr][move][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        auto destination = [&counts] {
+            ObjectOwner source(new TrackedObject(counts, 7));
+            // 显式从 source 构造返回对象；源先析构，不能删除已交出的对象。
+            return ObjectOwner(std::move(source));
+        }();
+        REQUIRE(destination.get() != nullptr);
+        REQUIRE(counts.live == 1);
+        CHECK(destination->value == 7);
+        CHECK(counts.constructed == 1);
+        CHECK(counts.destroyed == 0);
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr move assignment handles every empty and owning combination",
+          "[unique_ptr][move_assignment][lifetime]")
+{
+    bool source_owns = false;
+    bool destination_owns = false;
+    SECTION("both empty") {}
+    SECTION("owning source and empty destination") { source_owns = true; }
+    SECTION("empty source and owning destination") { destination_owns = true; }
+    SECTION("both owning")
+    {
+        source_owns = true;
+        destination_owns = true;
+    }
+
+    LifetimeCounts source_counts;
+    LifetimeCounts destination_counts;
+    {
+        ObjectOwner source(source_owns ? new TrackedObject(source_counts, 7) : nullptr);
+        ObjectOwner destination(destination_owns ?
+                                   new TrackedObject(destination_counts, 11) : nullptr);
+        auto* transferred = source.get();
+        auto& result = (destination = std::move(source));
+
+        CHECK(std::addressof(result) == std::addressof(destination));
+        CHECK(source.get() == nullptr);
+        CHECK_FALSE(static_cast<bool>(source));
+        REQUIRE(destination.get() == transferred);
+        CHECK(static_cast<bool>(destination) == source_owns);
+        CHECK(source_counts.constructed == (source_owns ? 1 : 0));
+        REQUIRE(source_counts.live == (source_owns ? 1 : 0));
+        CHECK(source_counts.destroyed == 0);
+        // 必须释放目标原来的对象；直接覆盖指针会遗失这份资源。
+        CHECK(destination_counts.constructed == (destination_owns ? 1 : 0));
+        CHECK(destination_counts.live == 0);
+        CHECK(destination_counts.destroyed == (destination_owns ? 1 : 0));
+        if (source_owns) { CHECK(destination->value == 7); }
+    }
+    CHECK(source_counts.live == 0);
+    CHECK(source_counts.destroyed == (source_owns ? 1 : 0));
+    CHECK(destination_counts.live == 0);
+    CHECK(destination_counts.destroyed == (destination_owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr self move assignment preserves ownership without destruction",
+          "[unique_ptr][move_assignment][lifetime]")
+{
+    bool owns = false;
+    SECTION("empty owner") {}
+    SECTION("owning object") { owns = true; }
+
+    LifetimeCounts counts;
+    {
+        ObjectOwner owner(owns ? new TrackedObject(counts, 7) : nullptr);
+        auto* object = owner.get();
+        auto& alias = owner;
+        auto& result = (owner = std::move(alias));
+        // 本项目明确规定自移动不做资源工作：先删除自己再取指针会悬空。
+        CHECK(std::addressof(result) == std::addressof(owner));
+        REQUIRE(owner.get() == object);
+        CHECK(static_cast<bool>(owner) == owns);
+        CHECK(counts.constructed == (owns ? 1 : 0));
+        REQUIRE(counts.live == (owns ? 1 : 0));
+        CHECK(counts.destroyed == 0);
+        if (owns) { CHECK(owner->value == 7); }
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr repeated move assignment reuses moved-from owners",
+          "[unique_ptr][move_assignment][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        ObjectOwner first(new TrackedObject(counts, 7));
+        ObjectOwner second(new TrackedObject(counts, 11));
+        ObjectOwner third(new TrackedObject(counts, 13));
+        auto* object = first.get();
+
+        second = std::move(first);
+        CHECK(first.get() == nullptr);
+        CHECK(second.get() == object);
+        CHECK(counts.live == 2);
+        CHECK(counts.destroyed == 1);
+
+        third = std::move(second);
+        CHECK(second.get() == nullptr);
+        CHECK(third.get() == object);
+        CHECK(counts.live == 1);
+        CHECK(counts.destroyed == 2);
+
+        // 已移出的 first 仍然有效，可以再次接管；整个过程没有搬动 T。
+        first = std::move(third);
+        CHECK(third.get() == nullptr);
+        REQUIRE(first.get() == object);
+        REQUIRE(counts.live == 1);
+        CHECK(first->value == 7);
+        CHECK(counts.constructed == 3);
+        CHECK(counts.destroyed == 2);
+    }
+    CHECK(counts.constructed == 3);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 3);
+}
+
+TEST_CASE("UniquePtr move-assigned destination outlives its source",
+          "[unique_ptr][move_assignment][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        ObjectOwner destination(new TrackedObject(counts, 11));
+        {
+            ObjectOwner source(new TrackedObject(counts, 7));
+            destination = std::move(source);
+            CHECK(source.get() == nullptr);
+        }
+        REQUIRE(destination.get() != nullptr);
+        REQUIRE(counts.live == 1);
+        CHECK(destination->value == 7);
+        CHECK(counts.constructed == 2);
+        CHECK(counts.destroyed == 1);
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 2);
+}
+
+TEST_CASE("UniquePtr transferred ownership is released once during unwinding",
+          "[unique_ptr][move][lifetime][exception]")
+{
+    LifetimeCounts counts;
+    {
+        ObjectOwner source(new TrackedObject(counts, 7));
+        const auto leave_with_exception = [&source] {
+            ObjectOwner destination(std::move(source));
+            throw std::runtime_error("leave moved owner scope");
+        };
+        REQUIRE_THROWS_AS(leave_with_exception(), std::runtime_error);
+        CHECK(source.get() == nullptr);
+        CHECK_FALSE(static_cast<bool>(source));
+        CHECK(counts.constructed == 1);
+        CHECK(counts.live == 0);
+        CHECK(counts.destroyed == 1);
+    }
+    // 空源随后析构不能再次删除已经由目标释放的对象。
     CHECK(counts.live == 0);
     CHECK(counts.destroyed == 1);
 }
