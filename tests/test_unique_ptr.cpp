@@ -1,6 +1,8 @@
 #include <mycppcontainer/unique_ptr.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -290,6 +292,25 @@ static_assert(!CanMakeWithoutArgs<int[2]>);
 static_assert(std::is_same_v<decltype(mycppcontainer::make_unique<int>()), IntOwner>);
 // 即使 T 的初始化本身不抛异常，内存分配也可能失败。
 static_assert(!noexcept(mycppcontainer::make_unique<int>()));
+
+// 外部存储的释放责任属于调用方，删除器只结束其中 T 的生命周期。
+// 它与默认 delete 有不同的释放语义，能发现所有者绕过自定义策略的错误。
+struct DestroyOnlyDeleter {
+    DeletionCounts* counts;
+
+    void operator()(TrackedObject* ptr) const noexcept
+    {
+        ++counts->calls;
+        if (ptr == nullptr) { ++counts->null_calls; }
+        else { std::destroy_at(ptr); }
+    }
+};
+
+struct alignas(64) AlignedOwnedObject {
+    TrackedObject object;
+
+    AlignedOwnedObject(LifetimeCounts& counts, int value) : object(counts, value) {}
+};
 
 } // namespace
 
@@ -1510,4 +1531,66 @@ TEST_CASE("make_unique propagates construction failure and unwinds constructed m
     CHECK(counts.live == 0);
     CHECK(counts.destroyed == 1);
     // 计数验证成员资源的回收，外层原始存储的泄漏留待 ASan/LSan 检查。
+}
+
+TEST_CASE("UniquePtr custom policy destroys objects in externally owned storage",
+          "[unique_ptr][final_validation][deleter][lifetime]")
+{
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    alignas(TrackedObject) std::byte first_storage[sizeof(TrackedObject)];
+    alignas(TrackedObject) std::byte second_storage[sizeof(TrackedObject)];
+    {
+        auto* first = std::construct_at(reinterpret_cast<TrackedObject*>(first_storage),
+                                        counts, 7);
+        mycppcontainer::UniquePtr<TrackedObject, DestroyOnlyDeleter> owner(
+            first, DestroyOnlyDeleter{&deletions});
+        REQUIRE(owner.get() == first);
+        CHECK(counts.live == 1);
+
+        auto* second = std::construct_at(reinterpret_cast<TrackedObject*>(second_storage),
+                                         counts, 11);
+        owner.reset(second);
+        CHECK(owner.get() == second);
+        CHECK(owner->value == 11);
+        CHECK(counts.constructed == 2);
+        CHECK(counts.live == 1);
+        CHECK(counts.destroyed == 1);
+        CHECK(deletions.calls == 1);
+        // 存储仍由两个局部字节数组管理，不能对这些地址执行 delete。
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 2);
+    CHECK(deletions.calls == 2);
+    CHECK(deletions.null_calls == 0);
+}
+
+TEST_CASE("UniquePtr factory and default cleanup support over-aligned objects",
+          "[unique_ptr][final_validation][alignment][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        auto source = mycppcontainer::make_unique<AlignedOwnedObject>(counts, 7);
+        auto* first = source.get();
+        REQUIRE(first != nullptr);
+        CHECK(reinterpret_cast<std::uintptr_t>(first) % alignof(AlignedOwnedObject) == 0);
+
+        auto owner = std::move(source);
+        CHECK(source.get() == nullptr);
+        CHECK(owner.get() == first);
+        CHECK(counts.constructed == 1);
+        CHECK(counts.destroyed == 0);
+
+        auto* second = new AlignedOwnedObject(counts, 11);
+        owner.reset(second);
+        REQUIRE(owner.get() == second);
+        CHECK(reinterpret_cast<std::uintptr_t>(second) % alignof(AlignedOwnedObject) == 0);
+        CHECK(owner->object.value == 11);
+        CHECK(counts.live == 1);
+        CHECK(counts.destroyed == 1);
+        // ASan/UBSan 补充检查对齐访问以及 aligned new/delete 的配对。
+    }
+    CHECK(counts.constructed == 2);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 2);
 }
