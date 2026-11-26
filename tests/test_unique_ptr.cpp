@@ -258,6 +258,39 @@ static_assert(std::is_same_v<decltype(std::declval<const MoveOnlyOwner&>().get_d
                            const NonDefaultMoveOnlyDeleter&>);
 static_assert(noexcept(std::declval<MoveOnlyOwner&>().swap(std::declval<MoveOnlyOwner&>())));
 
+// 三个重载区分可变左值、const 左值和右值，直接检查工厂保留的实参类别。
+struct FactoryArgumentProbe {
+    enum class Kind { mutable_lvalue, const_lvalue, rvalue };
+
+    explicit FactoryArgumentProbe(int&) : kind(Kind::mutable_lvalue) {}
+    explicit FactoryArgumentProbe(const int&) : kind(Kind::const_lvalue) {}
+    explicit FactoryArgumentProbe(int&&) : kind(Kind::rvalue) {}
+
+    Kind kind;
+};
+
+struct FactoryConstructionFailure {
+    explicit FactoryConstructionFailure(std::unique_ptr<TrackedObject> resource)
+        : member(std::move(resource))
+    {
+        // 成员已接管资源，但外层对象构造失败。展开时应销毁已构造的成员。
+        throw std::runtime_error("fail after member construction");
+    }
+
+    std::unique_ptr<TrackedObject> member;
+};
+
+template<class T>
+concept CanMakeWithoutArgs = requires { mycppcontainer::make_unique<T>(); };
+
+// 数组应由接口约束排除。普通单对象的返回值使用项目的默认删除器。
+static_assert(CanMakeWithoutArgs<int>);
+static_assert(!CanMakeWithoutArgs<int[]>);
+static_assert(!CanMakeWithoutArgs<int[2]>);
+static_assert(std::is_same_v<decltype(mycppcontainer::make_unique<int>()), IntOwner>);
+// 即使 T 的初始化本身不抛异常，内存分配也可能失败。
+static_assert(!noexcept(mycppcontainer::make_unique<int>()));
+
 } // namespace
 
 TEST_CASE("UniquePtr default construction is empty", "[unique_ptr][basic]")
@@ -1404,4 +1437,77 @@ TEST_CASE("UniquePtr policy layout does not exceed ordinary member storage",
     CHECK(alignof(CustomOwner) >= alignof(CountingDeleter));
     // 相等也会通过：本测试只能检查布局上界，不能单独证明压缩生效。
     // 验收还需源码确认 [[no_unique_address]]，并记录当前编译器的实际布局。
+}
+
+TEST_CASE("make_unique value-initializes a single object without arguments",
+          "[unique_ptr][make_unique]")
+{
+    auto owner = mycppcontainer::make_unique<int>();
+    REQUIRE(owner.get() != nullptr);
+    CHECK(*owner == 0);
+}
+
+TEST_CASE("make_unique constructs an immovable object directly from multiple arguments",
+          "[unique_ptr][make_unique][lifetime]")
+{
+    LifetimeCounts counts;
+    {
+        // TrackedObject 不可拷贝也不可移动，工厂必须在目标存储上直接构造它。
+        auto owner = mycppcontainer::make_unique<TrackedObject>(counts, 42);
+        static_assert(std::is_same_v<decltype(owner), ObjectOwner>);
+        REQUIRE(owner.get() != nullptr);
+        CHECK(owner->value == 42);
+        CHECK(counts.constructed == 1);
+        CHECK(counts.live == 1);
+        CHECK(counts.destroyed == 0);
+    }
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("make_unique preserves argument value category and constness",
+          "[unique_ptr][make_unique][forwarding]")
+{
+    int value = 1;
+    const int const_value = 2;
+    auto from_lvalue = mycppcontainer::make_unique<FactoryArgumentProbe>(value);
+    auto from_const_lvalue = mycppcontainer::make_unique<FactoryArgumentProbe>(const_value);
+    auto from_rvalue = mycppcontainer::make_unique<FactoryArgumentProbe>(3);
+
+    REQUIRE(from_lvalue.get() != nullptr);
+    REQUIRE(from_const_lvalue.get() != nullptr);
+    REQUIRE(from_rvalue.get() != nullptr);
+    CHECK(from_lvalue->kind == FactoryArgumentProbe::Kind::mutable_lvalue);
+    CHECK(from_const_lvalue->kind == FactoryArgumentProbe::Kind::const_lvalue);
+    CHECK(from_rvalue->kind == FactoryArgumentProbe::Kind::rvalue);
+}
+
+TEST_CASE("make_unique forwards a move-only constructor argument",
+          "[unique_ptr][make_unique][forwarding]")
+{
+    using MoveOnlyArgument = std::unique_ptr<int>;
+    auto argument = std::make_unique<int>(42);
+    auto* object = argument.get();
+
+    // 直接构造被管理的 std::unique_ptr<int>，由它接收移动实参的资源。
+    auto owner = mycppcontainer::make_unique<MoveOnlyArgument>(std::move(argument));
+    REQUIRE(owner.get() != nullptr);
+    CHECK(argument.get() == nullptr);
+    CHECK(owner->get() == object);
+}
+
+TEST_CASE("make_unique propagates construction failure and unwinds constructed members",
+          "[unique_ptr][make_unique][exception][lifetime]")
+{
+    LifetimeCounts counts;
+    auto argument = std::make_unique<TrackedObject>(counts, 7);
+
+    REQUIRE_THROWS_AS(
+        mycppcontainer::make_unique<FactoryConstructionFailure>(std::move(argument)),
+        std::runtime_error);
+    CHECK(argument.get() == nullptr);
+    CHECK(counts.constructed == 1);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+    // 计数验证成员资源的回收，外层原始存储的泄漏留待 ASan/LSan 检查。
 }
