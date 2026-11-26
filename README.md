@@ -6,8 +6,8 @@ MyCppContainer is a Modern C++20 Container Lab focused on container design,
 memory management, exception safety, and future performance research. It is an
 educational, header-only library in the `mycppcontainer` namespace.
 
-The Vector v0.1 educational core is complete and the project is preparing for
-initial publication. It implements a focused subset of `std::vector` behavior.
+The Vector v0.1 and UniquePtr educational cores are complete. They implement
+focused subsets of `std::vector` and `std::unique_ptr` behavior.
 No benchmark results or performance advantages over `std::vector` are claimed.
 
 ## Features
@@ -25,6 +25,19 @@ No benchmark results or performance advantages over `std::vector` are claimed.
   `begin/end/cbegin/cend`, including range-for and standard algorithm use.
 - Support for non-default-constructible, move-only, and over-aligned elements,
   subject to each operation's construction requirements.
+
+`mycppcontainer::UniquePtr<T, Deleter>` provides:
+
+- Default and explicit pointer construction, destruction, deleted copies,
+  and `noexcept` move construction/assignment with self-move protection.
+- `get()`, `operator*`, `operator->`, and explicit `operator bool`.
+- `release()`, `reset()`, and member `swap()` with self-swap protection.
+- A default `std::default_delete<T>` policy, custom value deleters, and
+  const/mutable `get_deleter()` access.
+- Stateful, stateless, move-only, and non-default-constructible deleters,
+  with construction constrained by the policy's capabilities.
+- `[[no_unique_address]]` storage for the policy and a forwarding
+  `mycppcontainer::make_unique<T>(args...)` factory for single objects.
 
 ## Design
 
@@ -49,6 +62,19 @@ Copying allocates capacity equal to the source size; copying an empty vector
 produces null storage and zero capacity. Copy assignment does not reuse spare
 target capacity. These are deliberate policies of this implementation.
 
+UniquePtr stores a pointer and its deletion policy as one ownership unit.
+Moves and swaps transfer both. Move assignment releases the old destination
+resource with its old policy before replacing the policy. `reset()` publishes
+the replacement pointer before cleaning up the old resource. Empty ownership
+does not invoke the deleter. `release()` transfers deletion responsibility to
+the caller and retains the stored policy.
+
+The factory forwards arguments directly into the new object, allowing T itself
+to be immovable. Construction failures propagate, and the new expression
+reclaims its allocation if initialization throws. Empty policy storage may
+overlap other storage through `[[no_unique_address]]`; exact object size depends
+on the implementation and ABI.
+
 ## Project Structure
 
 ```text
@@ -59,6 +85,7 @@ target capacity. These are deliberate policies of this implementation.
 ├── .gitignore
 ├── include/mycppcontainer/
 │   ├── config.hpp
+│   ├── unique_ptr.hpp
 │   └── vector.hpp
 ├── examples/
 │   ├── CMakeLists.txt
@@ -66,6 +93,7 @@ target capacity. These are deliberate policies of this implementation.
 └── tests/
     ├── CMakeLists.txt
     ├── test_smoke.cpp
+    ├── test_unique_ptr.cpp
     └── test_vector.cpp
 ```
 
@@ -142,7 +170,24 @@ The build also runs Catch2 test discovery. Its verbose output should show
 
 ## Validation
 
-Acceptance review on **2026-11-25** validated the implementation and tests now
+UniquePtr acceptance on **2026-11-26** reviewed implementation commit `aa97694`
+and the final test suite in `0839f54`. Independent build directories were used
+for the following results:
+
+| Configuration | Passed / total | Failed | Compiler warnings | Sanitizer diagnostics |
+| --- | --- | --- | --- | --- |
+| Debug | 140 / 140 | 0 | 0 | Not enabled |
+| Release (`-O3 -DNDEBUG`) | 140 / 140 | 0 | 0 | Not enabled |
+| Debug + ASan/UBSan, leak detection enabled | 140 / 140 | 0 | 0 | None reported |
+
+This suite contains 51 UniquePtr cases, 88 Vector cases, and one smoke case.
+All three builds used C++20 and `-Wall -Wextra -Wpedantic`. Standalone compilation
+of `unique_ptr.hpp` with `-std=c++20` also passed. UniquePtr cases cover ownership
+transfers, null states, policy selection and movement, external object storage,
+over-aligned objects, forwarding, and exception cleanup. Source review found
+no blocking issue within the documented policy contracts.
+
+Earlier Vector v0.1 acceptance on **2026-11-25** validated the implementation and tests
 recorded in commit `9f6ced7`, using separate, freshly configured build directories.
 
 | Configuration | Passed / total | Failed | Compiler warnings | Sanitizer diagnostics |
@@ -151,7 +196,7 @@ recorded in commit `9f6ced7`, using separate, freshly configured build directori
 | Release (`-O3 -DNDEBUG`) | 89 / 89 | 0 | 0 | Not enabled |
 | Debug + ASan/UBSan, leak detection enabled | 89 / 89 | 0 | 0 | None reported |
 
-The suite contains 88 Vector test cases and one smoke test. Catch2 sections are
+That suite contained 88 Vector test cases and one smoke test. Catch2 sections are
 not separate CTest cases. All three builds used `-Wall -Wextra -Wpedantic`.
 A standalone header compilation check with `-std=c++20` also passed.
 
@@ -166,7 +211,7 @@ clean sanitizer runs do not prove the absence of all lifetime errors or UB.
 
 ## Limitations
 
-- This is a subset of the STL interface: no `at()`, `insert()`, `erase()`,
+- Vector provides a subset of the STL interface: no `at()`, `insert()`, `erase()`,
   `resize()`, range/initializer-list constructors, or reverse iterators.
   `at()` is intentionally outside the current core scope.
 - Allocation is fixed to `std::allocator<T>`; allocator customization and
@@ -186,11 +231,32 @@ clean sanitizer runs do not prove the absence of all lifetime errors or UB.
   including an internal element passed as a move source, are not rolled back.
 - There is no CI pipeline or benchmark suite yet.
 
+UniquePtr contracts and limits:
+
+- Only single-object ownership with `T*` and ordinary value deleters is supported.
+  Arrays, fancy pointers, reference deleters, converting moves, and complete
+  constexpr/STL interface compatibility are outside the current scope.
+- A pointer must have one deleting owner and be compatible with its policy.
+  The default policy requires scalar-delete-compatible storage and a complete T
+  at deletion. Destruction and all policy operations used by the owner must not
+  throw. Default and pointer-only construction require a nothrow
+  default-constructible policy.
+- Dereference and member access require a non-null pointer. `get()` borrows
+  access. `release()` leaves the caller responsible for arranging compatible
+  cleanup. A replacement passed to `reset()` must be independently adoptable;
+  nonempty `p.reset(p.get())` is outside the contract.
+- A moved-from owner has a null pointer and its policy's moved-from state.
+  Before adopting a new resource, ensure that policy remains compatible or
+  assign another complete owner. Changes through `get_deleter()` must also
+  preserve resource compatibility.
+- The factory uses the default deleter. Array and custom-deleter factories are
+  outside the current scope. Constructor effects on forwarded arguments are
+  not rolled back after failure.
+
 ## Roadmap
 
 All items below are **planned, not implemented**:
 
-- `UniquePtr<T>` ownership utilities.
 - Allocator concepts and configurable allocation.
 - `SmallVector<T, N>` with small-buffer optimization.
 - Benchmarks for allocation behavior, cache locality, and latency.
@@ -200,6 +266,8 @@ All items below are **planned, not implemented**:
 The repository sources define the behavior documented here:
 
 - [Vector implementation](include/mycppcontainer/vector.hpp)
+- [UniquePtr implementation and factory](include/mycppcontainer/unique_ptr.hpp)
+- [UniquePtr behavioral specifications and regression tests](tests/test_unique_ptr.cpp)
 - [Behavioral specifications and regression tests](tests/test_vector.cpp)
 - [CMake target configuration](CMakeLists.txt)
 - [Catch2 and CTest integration](tests/CMakeLists.txt)
