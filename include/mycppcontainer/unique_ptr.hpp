@@ -104,4 +104,12 @@ public:
     }
 };
 
+template<typename T,typename... Args>
+    requires (!std::is_array_v<T>)
+UniquePtr<T>
+make_unique(Args&&... args)
+{
+    return UniquePtr<T>(new T(std::forward<Args>(args)...));
+}
+
 }
