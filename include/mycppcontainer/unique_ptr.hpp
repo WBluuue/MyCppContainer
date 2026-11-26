@@ -2,6 +2,7 @@
 
 #include<memory>
 #include<utility>
+#include<type_traits>
 
 namespace mycppcontainer
 {
@@ -11,11 +12,14 @@ class UniquePtr
 {
 private:
     T* data_{nullptr};
-    Deleter deleter_{};
+    [[no_unique_address]] Deleter deleter_{};
 public:
-    UniquePtr() noexcept {}
+    UniquePtr() noexcept 
+        requires std::is_nothrow_default_constructible_v<Deleter>
+    {}
 
     explicit UniquePtr(T* ptr) noexcept
+        requires std::is_nothrow_default_constructible_v<Deleter>
     :   data_(ptr)
     {}
 
@@ -92,13 +96,11 @@ public:
 
     void swap(UniquePtr& other) noexcept
     {
-        auto optr=other.data_;
-        other.data_=data_;
-        data_=optr;
-
-        auto odel=other.deleter_;
-        other.deleter_=deleter_;
-        deleter_=odel;
+        if(this!=(&other))
+        {
+            std::swap(data_,other.data_);
+            std::swap(deleter_,other.deleter_);
+        }
     }
 };
 
