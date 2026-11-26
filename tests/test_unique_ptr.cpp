@@ -64,7 +64,7 @@ struct ResetObserver {
     }
 };
 
-// U4a 只覆盖可默认构造、可拷贝的值类型删除器；move-only 和布局压缩留待后续。
+// U4a 的可默认构造、可拷贝删除器继续作为回归类型。
 struct PlainDelete {
     void operator()(TrackedObject* ptr) const noexcept { delete ptr; }
 };
@@ -106,6 +106,41 @@ struct CountingDeleter {
 
 using PlainOwner = mycppcontainer::UniquePtr<TrackedObject, PlainDelete>;
 using CustomOwner = mycppcontainer::UniquePtr<TrackedObject, CountingDeleter>;
+
+// 复用计数行为，只收紧测试类型的构造能力；继承仅用于测试夹具。
+// 核心 UniquePtr 仍保存删除器值成员，不要求改用继承实现。
+struct MoveOnlyDeleter : CountingDeleter {
+    MoveOnlyDeleter() noexcept = default;
+    explicit MoveOnlyDeleter(DeletionCounts& counters) noexcept : CountingDeleter(counters) {}
+    MoveOnlyDeleter(const MoveOnlyDeleter&) = delete;
+    MoveOnlyDeleter& operator=(const MoveOnlyDeleter&) = delete;
+    MoveOnlyDeleter(MoveOnlyDeleter&&) noexcept = default;
+    MoveOnlyDeleter& operator=(MoveOnlyDeleter&&) noexcept = default;
+};
+
+struct NonDefaultMoveOnlyDeleter : MoveOnlyDeleter {
+    NonDefaultMoveOnlyDeleter() = delete;
+    explicit NonDefaultMoveOnlyDeleter(DeletionCounts& counters) noexcept
+        : MoveOnlyDeleter(counters) {}
+    NonDefaultMoveOnlyDeleter(const NonDefaultMoveOnlyDeleter&) = delete;
+    NonDefaultMoveOnlyDeleter& operator=(const NonDefaultMoveOnlyDeleter&) = delete;
+    NonDefaultMoveOnlyDeleter(NonDefaultMoveOnlyDeleter&&) noexcept = default;
+    NonDefaultMoveOnlyDeleter& operator=(NonDefaultMoveOnlyDeleter&&) noexcept = default;
+};
+
+using DefaultMoveOnlyOwner = mycppcontainer::UniquePtr<TrackedObject, MoveOnlyDeleter>;
+using MoveOnlyOwner = mycppcontainer::UniquePtr<TrackedObject, NonDefaultMoveOnlyDeleter>;
+
+// 与普通“指针 + 删除器成员”布局比较；不把某个 ABI 的字节数写成通用保证。
+struct UncompressedIntOwnerLayout {
+    int* pointer;
+    std::default_delete<int> policy;
+};
+
+struct UncompressedCustomOwnerLayout {
+    TrackedObject* pointer;
+    CountingDeleter policy;
+};
 
 // 已通过的基础接口仍是回归要求；新增删除策略不能恢复任何拷贝通道。
 static_assert(std::is_nothrow_default_constructible_v<IntOwner>);
@@ -165,7 +200,7 @@ static_assert(std::is_same_v<decltype(std::declval<ObjectOwner&>().swap(
                                     std::declval<ObjectOwner&>())), void>);
 static_assert(noexcept(std::declval<ObjectOwner&>().swap(std::declval<ObjectOwner&>())));
 
-// U4a 新接口；当前单模板参数版本尚未实现，暂时无法编译属于预期状态。
+// U4a 删除策略接口已验收；放宽类型支持后仍须保留这些接口和保证。
 static_assert(std::is_empty_v<PlainDelete>);
 static_assert(std::is_same_v<IntOwner,
                            mycppcontainer::UniquePtr<int, std::default_delete<int>>>);
@@ -192,6 +227,36 @@ static_assert(noexcept(std::declval<const CustomOwner&>().get_deleter()));
 static_assert(noexcept(std::declval<CustomOwner&>().reset()));
 static_assert(noexcept(std::declval<CustomOwner&>().release()));
 static_assert(noexcept(std::declval<CustomOwner&>().swap(std::declval<CustomOwner&>())));
+
+// U4b：能力来自删除器本身，不可默认构造的策略不能凭空创建。
+// 这些否定断言要求构造函数正确参与重载决议，不能只在函数体内报错。
+static_assert(!std::is_copy_constructible_v<MoveOnlyDeleter>);
+static_assert(!std::is_copy_assignable_v<MoveOnlyDeleter>);
+static_assert(!std::is_default_constructible_v<NonDefaultMoveOnlyDeleter>);
+static_assert(!std::is_copy_constructible_v<NonDefaultMoveOnlyDeleter>);
+static_assert(std::is_nothrow_move_constructible_v<NonDefaultMoveOnlyDeleter>);
+static_assert(std::is_nothrow_move_assignable_v<NonDefaultMoveOnlyDeleter>);
+static_assert(std::is_nothrow_default_constructible_v<DefaultMoveOnlyOwner>);
+static_assert(std::is_nothrow_constructible_v<DefaultMoveOnlyOwner, TrackedObject*>);
+static_assert(!std::is_default_constructible_v<MoveOnlyOwner>);
+static_assert(!std::is_constructible_v<MoveOnlyOwner, TrackedObject*>);
+static_assert(!std::is_constructible_v<MoveOnlyOwner, decltype(nullptr)>);
+static_assert(std::is_nothrow_constructible_v<MoveOnlyOwner, TrackedObject*,
+                                            NonDefaultMoveOnlyDeleter&&>);
+static_assert(!std::is_constructible_v<MoveOnlyOwner, TrackedObject*,
+                                     NonDefaultMoveOnlyDeleter&>);
+static_assert(!std::is_constructible_v<MoveOnlyOwner, TrackedObject*,
+                                     const NonDefaultMoveOnlyDeleter&>);
+static_assert(!std::is_copy_constructible_v<MoveOnlyOwner>);
+static_assert(!std::is_copy_assignable_v<MoveOnlyOwner>);
+static_assert(std::is_nothrow_move_constructible_v<MoveOnlyOwner>);
+static_assert(std::is_nothrow_move_assignable_v<MoveOnlyOwner>);
+static_assert(std::is_nothrow_destructible_v<MoveOnlyOwner>);
+static_assert(std::is_same_v<decltype(std::declval<MoveOnlyOwner&>().get_deleter()),
+                           NonDefaultMoveOnlyDeleter&>);
+static_assert(std::is_same_v<decltype(std::declval<const MoveOnlyOwner&>().get_deleter()),
+                           const NonDefaultMoveOnlyDeleter&>);
+static_assert(noexcept(std::declval<MoveOnlyOwner&>().swap(std::declval<MoveOnlyOwner&>())));
 
 } // namespace
 
@@ -757,7 +822,7 @@ TEST_CASE("UniquePtr supports a default-constructed stateless deleter",
         CHECK(owner->value == 7);
         CHECK(counts.constructed == 1);
         CHECK(counts.destroyed == 0);
-        // 这里不要求 sizeof(owner) == sizeof(T*)；布局优化尚未开始。
+        // 这里验证资源释放；不要求 sizeof(owner) == sizeof(T*)，布局另行观察。
     }
     CHECK(counts.live == 0);
     CHECK(counts.destroyed == 1);
@@ -1063,4 +1128,280 @@ TEST_CASE("UniquePtr invokes its custom deleter once during stack unwinding",
     CHECK(counts.constructed == 1);
     CHECK(counts.live == 0);
     CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr default construction does not require copying its deleter",
+          "[unique_ptr][move_only_deleter][lifetime]")
+{
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    {
+        DefaultMoveOnlyOwner empty;
+        empty.get_deleter().counts = &deletions;
+        CHECK(empty.get() == nullptr);
+        empty.reset();
+
+        DefaultMoveOnlyOwner owner(new TrackedObject(counts, 7));
+        owner.get_deleter().counts = &deletions;
+        REQUIRE(counts.live == 1);
+        CHECK(owner->value == 7);
+        CHECK(counts.constructed == 1);
+        CHECK(deletions.calls == 0);
+    }
+    CHECK(deletions.calls == 1);
+    CHECK(deletions.null_calls == 0);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr adopts a resource with an explicit non-default move-only deleter",
+          "[unique_ptr][move_only_deleter][lifetime]")
+{
+    bool owns = false;
+    SECTION("null pointer with a valid policy") {}
+    SECTION("owned object with a valid policy") { owns = true; }
+
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    NonDefaultMoveOnlyDeleter policy(deletions);
+    {
+        auto* object = owns ? new TrackedObject(counts, 7) : nullptr;
+        MoveOnlyOwner owner(object, std::move(policy));
+        CHECK(owner.get() == object);
+        CHECK(static_cast<bool>(owner) == owns);
+        CHECK(owner.get_deleter().counts == &deletions);
+        CHECK(policy.counts == nullptr);
+        CHECK(deletions.calls == 0);
+        CHECK(counts.constructed == (owns ? 1 : 0));
+        CHECK(counts.live == (owns ? 1 : 0));
+    }
+    CHECK(deletions.calls == (owns ? 1 : 0));
+    CHECK(deletions.null_calls == 0);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr move-only policy and resource survive source destruction",
+          "[unique_ptr][move_only_deleter][move][lifetime]")
+{
+    bool owns = false;
+    SECTION("empty source still transfers its policy") {}
+    SECTION("owning source") { owns = true; }
+
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    {
+        auto destination = [&] {
+            MoveOnlyOwner source(owns ? new TrackedObject(counts, 7) : nullptr,
+                                 NonDefaultMoveOnlyDeleter(deletions));
+            auto* object = source.get();
+            MoveOnlyOwner transferred(std::move(source));
+            CHECK(source.get() == nullptr);
+            CHECK(source.get_deleter().counts == nullptr);
+            CHECK(transferred.get() == object);
+            CHECK(transferred.get_deleter().counts == &deletions);
+            CHECK(deletions.calls == 0);
+            return transferred;
+        }();
+        // 源已析构；策略保存在目标内部，不能借用源的删除器对象。
+        CHECK(destination.get_deleter().counts == &deletions);
+        CHECK(deletions.calls == 0);
+        REQUIRE(counts.live == (owns ? 1 : 0));
+        if (owns) { CHECK(destination->value == 7); }
+    }
+    CHECK(deletions.calls == (owns ? 1 : 0));
+    CHECK(deletions.null_calls == 0);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr move assignment supports non-default move-only policies",
+          "[unique_ptr][move_only_deleter][move_assignment][lifetime]")
+{
+    bool source_owns = false;
+    bool destination_owns = false;
+    SECTION("both empty") {}
+    SECTION("owning source and empty destination") { source_owns = true; }
+    SECTION("empty source and owning destination") { destination_owns = true; }
+    SECTION("both owning") { source_owns = true; destination_owns = true; }
+
+    LifetimeCounts source_counts;
+    LifetimeCounts destination_counts;
+    DeletionCounts source_deletions;
+    DeletionCounts destination_deletions;
+    {
+        MoveOnlyOwner source(source_owns ? new TrackedObject(source_counts, 7) : nullptr,
+                             NonDefaultMoveOnlyDeleter(source_deletions));
+        MoveOnlyOwner destination(destination_owns ? new TrackedObject(destination_counts, 11)
+                                                  : nullptr,
+                                  NonDefaultMoveOnlyDeleter(destination_deletions));
+        auto* object = source.get();
+        auto& result = (destination = std::move(source));
+        CHECK(std::addressof(result) == std::addressof(destination));
+        CHECK(source.get() == nullptr);
+        CHECK(source.get_deleter().counts == nullptr);
+        CHECK(destination.get() == object);
+        CHECK(destination.get_deleter().counts == &source_deletions);
+        CHECK(destination_deletions.calls == (destination_owns ? 1 : 0));
+        CHECK(destination_counts.live == 0);
+        CHECK(destination_counts.destroyed == (destination_owns ? 1 : 0));
+        CHECK(source_deletions.calls == 0);
+        CHECK(source_counts.live == (source_owns ? 1 : 0));
+        CHECK(source_counts.destroyed == 0);
+        // 已移出的 source 通过接收完整的指针/策略对恢复为可用所有者。
+        source = std::move(destination);
+        CHECK(destination.get() == nullptr);
+        CHECK(source.get() == object);
+        CHECK(source.get_deleter().counts == &source_deletions);
+        CHECK(source_deletions.calls == 0);
+    }
+    CHECK(source_deletions.calls == (source_owns ? 1 : 0));
+    CHECK(destination_deletions.calls == (destination_owns ? 1 : 0));
+    CHECK(source_deletions.null_calls == 0);
+    CHECK(destination_deletions.null_calls == 0);
+    CHECK(source_counts.live == 0);
+    CHECK(source_counts.destroyed == (source_owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr swap requires no copies of a move-only deleter",
+          "[unique_ptr][move_only_deleter][swap][lifetime]")
+{
+    bool first_owns = false;
+    bool second_owns = false;
+    SECTION("both empty") {}
+    SECTION("only first owns") { first_owns = true; }
+    SECTION("only second owns") { second_owns = true; }
+    SECTION("both own") { first_owns = true; second_owns = true; }
+
+    LifetimeCounts first_counts;
+    LifetimeCounts second_counts;
+    DeletionCounts first_deletions;
+    DeletionCounts second_deletions;
+    {
+        MoveOnlyOwner first(first_owns ? new TrackedObject(first_counts, 7) : nullptr,
+                            NonDefaultMoveOnlyDeleter(first_deletions));
+        MoveOnlyOwner second(second_owns ? new TrackedObject(second_counts, 11) : nullptr,
+                             NonDefaultMoveOnlyDeleter(second_deletions));
+        auto* first_object = first.get();
+        auto* second_object = second.get();
+        first.swap(second);
+        CHECK(first.get() == second_object);
+        CHECK(second.get() == first_object);
+        CHECK(first.get_deleter().counts == &second_deletions);
+        CHECK(second.get_deleter().counts == &first_deletions);
+        CHECK(first_deletions.calls == 0);
+        CHECK(second_deletions.calls == 0);
+        CHECK(first_counts.live == (first_owns ? 1 : 0));
+        CHECK(second_counts.live == (second_owns ? 1 : 0));
+        CHECK(first_counts.destroyed == 0);
+        CHECK(second_counts.destroyed == 0);
+    }
+    CHECK(first_deletions.calls == (first_owns ? 1 : 0));
+    CHECK(second_deletions.calls == (second_owns ? 1 : 0));
+    CHECK(first_deletions.null_calls == 0);
+    CHECK(second_deletions.null_calls == 0);
+    CHECK(first_counts.live == 0);
+    CHECK(second_counts.live == 0);
+    CHECK(first_counts.destroyed == (first_owns ? 1 : 0));
+    CHECK(second_counts.destroyed == (second_owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr self operations preserve a non-default move-only policy",
+          "[unique_ptr][move_only_deleter][boundary][lifetime]")
+{
+    bool owns = false;
+    SECTION("empty owner") {}
+    SECTION("owning object") { owns = true; }
+
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    {
+        MoveOnlyOwner owner(owns ? new TrackedObject(counts, 7) : nullptr,
+                            NonDefaultMoveOnlyDeleter(deletions));
+        auto* object = owner.get();
+        auto& alias = owner;
+        auto& result = (owner = std::move(alias));
+        CHECK(std::addressof(result) == std::addressof(owner));
+        CHECK(owner.get() == object);
+        CHECK(owner.get_deleter().counts == &deletions);
+        owner.swap(alias);
+        CHECK(owner.get() == object);
+        CHECK(owner.get_deleter().counts == &deletions);
+        CHECK(deletions.calls == 0);
+        CHECK(counts.live == (owns ? 1 : 0));
+        CHECK(counts.destroyed == 0);
+    }
+    CHECK(deletions.calls == (owns ? 1 : 0));
+    CHECK(deletions.null_calls == 0);
+    CHECK(counts.live == 0);
+    CHECK(counts.destroyed == (owns ? 1 : 0));
+}
+
+TEST_CASE("UniquePtr reset and release retain its noncopyable deletion policy",
+          "[unique_ptr][move_only_deleter][reset][release][lifetime]")
+{
+    LifetimeCounts old_counts;
+    LifetimeCounts new_counts;
+    DeletionCounts deletions;
+    {
+        MoveOnlyOwner owner(new TrackedObject(old_counts, 7),
+                            NonDefaultMoveOnlyDeleter(deletions));
+        auto* object = owner.get();
+        // 立即重新接管 release 的结果，避免测试断言失败留下无人管理的指针。
+        owner.reset(owner.release());
+        CHECK(owner.get() == object);
+        CHECK(owner.get_deleter().counts == &deletions);
+        CHECK(deletions.calls == 0);
+        CHECK(old_counts.live == 1);
+
+        auto* replacement = new TrackedObject(new_counts, 11);
+        owner.reset(replacement);
+        CHECK(owner.get() == replacement);
+        CHECK(owner.get_deleter().counts == &deletions);
+        CHECK(deletions.calls == 1);
+        CHECK(old_counts.live == 0);
+        CHECK(old_counts.destroyed == 1);
+        CHECK(new_counts.live == 1);
+        CHECK(new_counts.destroyed == 0);
+        owner.reset();
+        owner.reset(nullptr);
+    }
+    CHECK(deletions.calls == 2);
+    CHECK(deletions.null_calls == 0);
+    CHECK(new_counts.live == 0);
+    CHECK(new_counts.destroyed == 1);
+}
+
+TEST_CASE("UniquePtr moved move-only policy cleans up during exception unwinding",
+          "[unique_ptr][move_only_deleter][exception][lifetime]")
+{
+    LifetimeCounts counts;
+    DeletionCounts deletions;
+    {
+        MoveOnlyOwner source(new TrackedObject(counts, 7),
+                             NonDefaultMoveOnlyDeleter(deletions));
+        const auto leave_with_exception = [&] {
+            MoveOnlyOwner destination(std::move(source));
+            throw std::runtime_error("leave move-only policy scope");
+        };
+        REQUIRE_THROWS_AS(leave_with_exception(), std::runtime_error);
+        CHECK(source.get() == nullptr);
+        CHECK(deletions.calls == 1);
+        CHECK(counts.live == 0);
+        CHECK(counts.destroyed == 1);
+    }
+    CHECK(deletions.calls == 1);
+    CHECK(deletions.null_calls == 0);
+}
+
+TEST_CASE("UniquePtr policy layout does not exceed ordinary member storage",
+          "[unique_ptr][layout]")
+{
+    // 使用 -s 查看实际 sizeof；不强制任何平台上都等于一个指针的大小。
+    CHECK(sizeof(IntOwner) <= sizeof(UncompressedIntOwnerLayout));
+    CHECK(sizeof(CustomOwner) <= sizeof(UncompressedCustomOwnerLayout));
+    CHECK(alignof(IntOwner) >= alignof(int*));
+    CHECK(alignof(CustomOwner) >= alignof(CountingDeleter));
+    // 相等也会通过：本测试只能检查布局上界，不能单独证明压缩生效。
+    // 验收还需源码确认 [[no_unique_address]]，并记录当前编译器的实际布局。
 }
