@@ -1,35 +1,42 @@
 #pragma once
 
+#include<memory>
+#include<utility>
+
 namespace mycppcontainer
 {
 
-template<typename T>
+template<typename T,typename Deleter=std::default_delete<T>>
 class UniquePtr
 {
 private:
     T* data_{nullptr};
+    Deleter deleter_{};
 public:
     UniquePtr() noexcept {}
 
     explicit UniquePtr(T* ptr) noexcept
-    {
-        if(ptr!=nullptr)
-        {
-            data_=ptr;
-        }
-    }
+    :   data_(ptr)
+    {}
+
+    explicit UniquePtr(T* ptr,Deleter deleter) noexcept
+    :   data_(ptr),deleter_(std::move(deleter))
+    {}
 
     ~UniquePtr() noexcept
     {
-        delete data_;
+        if(data_!=nullptr)
+        {
+            deleter_(data_);
+        }
     }
 
     UniquePtr(const UniquePtr&)=delete;
 
     UniquePtr(UniquePtr&& other) noexcept
+    : data_(other.data_),deleter_(std::move(other.deleter_))
     {
-        data_=other.data_;
-        other.data_=nullptr;   
+        other.data_=nullptr;
     }
 
     UniquePtr& operator=(const UniquePtr&)=delete;
@@ -38,16 +45,25 @@ public:
     {
         if(this!=(&rhs))
         {
-            delete data_;
+            if(data_!=nullptr)
+            {
+                deleter_(data_);
+            }
 
             data_=rhs.data_;
             rhs.data_=nullptr;
+
+            deleter_=std::move(rhs.deleter_);
         }
         return *this;   
     }
 
 public:
     T* get() const noexcept { return data_; }
+
+    Deleter& get_deleter() noexcept { return deleter_; }
+
+    const Deleter& get_deleter() const noexcept { return deleter_; }
 
     T& operator*() const noexcept { return *data_; }
 
@@ -67,7 +83,11 @@ public:
     {
         auto optr=data_;
         data_=ptr;
-        delete optr;
+
+        if(optr!=nullptr)
+        {
+            deleter_(optr);
+        }
     }
 
     void swap(UniquePtr& other) noexcept
@@ -75,6 +95,10 @@ public:
         auto optr=other.data_;
         other.data_=data_;
         data_=optr;
+
+        auto odel=other.deleter_;
+        other.deleter_=deleter_;
+        deleter_=odel;
     }
 };
 
